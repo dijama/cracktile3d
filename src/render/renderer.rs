@@ -6,6 +6,8 @@ use crate::render::camera::Camera;
 use crate::render::grid::GridRenderer;
 use crate::render::vertex::{LineVertex, Vertex};
 use crate::scene::Scene;
+use crate::scene::mesh::Face;
+use crate::tools::edit::Selection;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -23,6 +25,7 @@ pub struct Renderer {
 
     tile_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    selection_line_pipeline: wgpu::RenderPipeline,
     grid: GridRenderer,
 
     // Placeholder 1x1 white texture + bind group for untextured rendering
@@ -234,6 +237,46 @@ impl Renderer {
             cache: None,
         });
 
+        // Selection overlay line pipeline (renders on top via depth bias)
+        let selection_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("selection_line_pipeline"),
+            layout: Some(&line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[LineVertex::LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let grid = GridRenderer::new(&device, 20, 1.0);
 
         // Placeholder 1x1 white texture for untextured tiles
@@ -285,6 +328,7 @@ impl Renderer {
             camera_bind_group,
             tile_pipeline,
             line_pipeline,
+            selection_line_pipeline,
             grid,
             placeholder_bind_group,
             tile_bind_group_layout,
@@ -302,50 +346,249 @@ impl Renderer {
         self.camera.set_aspect(width as f32, height as f32);
     }
 
+    /// Upload per-frame data (camera, grid) before the render pass begins.
+    pub fn prepare_frame(&mut self, scene: &Scene) {
+        let vp = self.camera.view_projection();
+        let vp_raw: [f32; 16] = vp.to_cols_array();
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&vp_raw));
+        self.grid.upload(&self.queue, 20, 1.0, scene.crosshair_pos);
+    }
+
     pub fn render_scene<'a>(
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         scene: &Scene,
         _input: &InputState,
+        wireframe: bool,
     ) {
-        // Update camera uniform
-        let vp = self.camera.view_projection();
-        let vp_raw: [f32; 16] = vp.to_cols_array();
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&vp_raw));
-
         // Draw grid
-        self.grid.upload(&self.queue, 20, 1.0, scene.crosshair_pos);
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_vertex_buffer(0, self.grid.vertex_buffer.slice(..));
         pass.draw(0..self.grid.vertex_count, 0..1);
 
+        // Draw elevated grid (when crosshair is above/below ground)
+        if self.grid.elevated_vertex_count > 0 {
+            pass.set_vertex_buffer(0, self.grid.elevated_buffer.slice(..));
+            pass.draw(0..self.grid.elevated_vertex_count, 0..1);
+        }
+
         // Draw crosshair
         pass.set_vertex_buffer(0, self.grid.crosshair_buffer.slice(..));
         pass.draw(0..self.grid.crosshair_vertex_count, 0..1);
 
-        // Draw scene objects
-        pass.set_pipeline(&self.tile_pipeline);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        if wireframe {
+            self.render_wireframe(pass, scene);
+        } else {
+            // Draw scene objects as solid tiles
+            pass.set_pipeline(&self.tile_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+            for layer in &scene.layers {
+                if !layer.visible {
+                    continue;
+                }
+                for object in &layer.objects {
+                    if let Some(ref gpu_mesh) = object.gpu_mesh {
+                        let bind_group = object.tileset_index
+                            .and_then(|idx| scene.tilesets.get(idx))
+                            .and_then(|ts| ts.bind_group.as_ref())
+                            .unwrap_or(&self.placeholder_bind_group);
+                        pass.set_bind_group(1, bind_group, &[]);
+                        pass.set_vertex_buffer(0, gpu_mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(gpu_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..gpu_mesh.index_count, 0, 0..1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw all scene geometry as wireframe outlines (gray lines).
+    fn render_wireframe<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, scene: &Scene) {
+        let color = [0.8, 0.8, 0.8, 1.0];
+        let mut line_verts: Vec<LineVertex> = Vec::new();
 
         for layer in &scene.layers {
             if !layer.visible {
                 continue;
             }
             for object in &layer.objects {
-                if let Some(ref gpu_mesh) = object.gpu_mesh {
-                    // Use tileset bind group if available, otherwise placeholder
-                    let bind_group = object
-                        .tileset_bind_group
-                        .as_ref()
-                        .unwrap_or(&self.placeholder_bind_group);
-                    pass.set_bind_group(1, bind_group, &[]);
-                    pass.set_vertex_buffer(0, gpu_mesh.vertex_buffer.slice(..));
-                    pass.set_index_buffer(gpu_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..gpu_mesh.index_count, 0, 0..1);
+                for face in &object.faces {
+                    let p = &face.positions;
+                    for i in 0..4 {
+                        let a = p[i];
+                        let b = p[(i + 1) % 4];
+                        line_verts.push(LineVertex { position: a.into(), color });
+                        line_verts.push(LineVertex { position: b.into(), color });
+                    }
                 }
             }
         }
+
+        if line_verts.is_empty() {
+            return;
+        }
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wireframe_lines"),
+            contents: bytemuck::cast_slice(&line_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        pass.set_pipeline(&self.line_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..line_verts.len() as u32, 0..1);
+    }
+
+    /// Draw wireframe outlines for selected faces/objects/vertices.
+    pub fn render_selection<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        scene: &Scene,
+        selection: &Selection,
+    ) {
+        if selection.is_empty() {
+            return;
+        }
+
+        let highlight_color = [1.0, 1.0, 0.3, 1.0]; // Yellow
+        let vertex_color = [0.3, 1.0, 1.0, 1.0]; // Cyan
+        let mut line_verts: Vec<LineVertex> = Vec::new();
+
+        // Face-level selection: draw quad edges
+        for &(li, oi, fi) in &selection.faces {
+            if let Some(face) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.faces.get(fi))
+            {
+                let p = &face.positions;
+                for i in 0..4 {
+                    let a = p[i];
+                    let b = p[(i + 1) % 4];
+                    line_verts.push(LineVertex { position: a.into(), color: highlight_color });
+                    line_verts.push(LineVertex { position: b.into(), color: highlight_color });
+                }
+            }
+        }
+
+        // Object-level selection: outline all faces
+        for &(li, oi) in &selection.objects {
+            if let Some(object) = scene.layers.get(li).and_then(|l| l.objects.get(oi)) {
+                for face in &object.faces {
+                    let p = &face.positions;
+                    for i in 0..4 {
+                        let a = p[i];
+                        let b = p[(i + 1) % 4];
+                        line_verts.push(LineVertex { position: a.into(), color: highlight_color });
+                        line_verts.push(LineVertex { position: b.into(), color: highlight_color });
+                    }
+                }
+            }
+        }
+
+        // Vertex-level selection: draw small crosshairs
+        for &(li, oi, fi, vi) in &selection.vertices {
+            if let Some(pos) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.faces.get(fi))
+                .map(|f| f.positions[vi])
+            {
+                let s = 0.15;
+                line_verts.push(LineVertex { position: [pos.x - s, pos.y, pos.z], color: vertex_color });
+                line_verts.push(LineVertex { position: [pos.x + s, pos.y, pos.z], color: vertex_color });
+                line_verts.push(LineVertex { position: [pos.x, pos.y - s, pos.z], color: vertex_color });
+                line_verts.push(LineVertex { position: [pos.x, pos.y + s, pos.z], color: vertex_color });
+                line_verts.push(LineVertex { position: [pos.x, pos.y, pos.z - s], color: vertex_color });
+                line_verts.push(LineVertex { position: [pos.x, pos.y, pos.z + s], color: vertex_color });
+            }
+        }
+
+        if line_verts.is_empty() {
+            return;
+        }
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("selection_lines"),
+            contents: bytemuck::cast_slice(&line_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        pass.set_pipeline(&self.selection_line_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..line_verts.len() as u32, 0..1);
+    }
+
+    /// Render a placement preview as colored wireframe outlines.
+    pub fn render_preview<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        faces: &[Face],
+    ) {
+        if faces.is_empty() {
+            return;
+        }
+
+        let color = [0.3, 1.0, 0.5, 1.0]; // Green
+        let mut line_verts: Vec<LineVertex> = Vec::new();
+
+        for face in faces {
+            let p = &face.positions;
+            for i in 0..4 {
+                let a = p[i];
+                let b = p[(i + 1) % 4];
+                line_verts.push(LineVertex { position: a.into(), color });
+                line_verts.push(LineVertex { position: b.into(), color });
+            }
+        }
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("preview_lines"),
+            contents: bytemuck::cast_slice(&line_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        pass.set_pipeline(&self.selection_line_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..line_verts.len() as u32, 0..1);
+    }
+
+    /// Render a hover highlight on a single face.
+    pub fn render_hover<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        scene: &Scene,
+        hover: Option<(usize, usize, usize)>,
+    ) {
+        let Some((li, oi, fi)) = hover else { return };
+        let Some(face) = scene.layers.get(li)
+            .and_then(|l| l.objects.get(oi))
+            .and_then(|o| o.faces.get(fi))
+        else { return };
+
+        let color = [0.5, 0.7, 1.0, 1.0]; // Light blue
+        let mut line_verts: Vec<LineVertex> = Vec::new();
+        let p = &face.positions;
+        for i in 0..4 {
+            let a = p[i];
+            let b = p[(i + 1) % 4];
+            line_verts.push(LineVertex { position: a.into(), color });
+            line_verts.push(LineVertex { position: b.into(), color });
+        }
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hover_lines"),
+            contents: bytemuck::cast_slice(&line_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        pass.set_pipeline(&self.selection_line_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..line_verts.len() as u32, 0..1);
     }
 
     fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

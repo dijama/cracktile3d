@@ -1,12 +1,15 @@
 use glam::{Vec2, Vec3, Vec4};
+use serde::{Serialize, Deserialize};
 use crate::render::Vertex;
 
 /// A single quad face (4 vertices, 2 triangles).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Face {
     pub positions: [Vec3; 4],
     pub uvs: [Vec2; 4],
     pub colors: [Vec4; 4],
+    #[serde(default)]
+    pub hidden: bool,
 }
 
 impl Face {
@@ -26,6 +29,26 @@ impl Face {
             ],
             uvs,
             colors: [Vec4::ONE; 4],
+            hidden: false,
+        }
+    }
+
+    /// Create a rectangular quad (different width/height) for multi-tile placement.
+    pub fn new_rect_quad(center: Vec3, normal: Vec3, half_w: f32, half_h: f32, uvs: [Vec2; 4]) -> Self {
+        let (right, up) = tangent_basis(normal);
+        let r = right * half_w;
+        let u = up * half_h;
+
+        Self {
+            positions: [
+                center - r - u,
+                center + r - u,
+                center + r + u,
+                center - r + u,
+            ],
+            uvs,
+            colors: [Vec4::ONE; 4],
+            hidden: false,
         }
     }
 

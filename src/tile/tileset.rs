@@ -9,14 +9,20 @@ pub struct Tileset {
     pub tile_height: u32,
     pub gpu_texture: Option<wgpu::Texture>,
     pub bind_group: Option<wgpu::BindGroup>,
+    /// egui texture ID for displaying in the tileset browser panel.
+    pub egui_texture_id: Option<egui::TextureId>,
+    /// Raw RGBA pixel data, kept for egui registration.
+    pub image_data: Option<Vec<u8>>,
 }
 
 impl Tileset {
     pub fn cols(&self) -> u32 {
+        if self.tile_width == 0 { return 0; }
         self.image_width / self.tile_width
     }
 
     pub fn rows(&self) -> u32 {
+        if self.tile_height == 0 { return 0; }
         self.image_height / self.tile_height
     }
 
@@ -27,6 +33,22 @@ impl Tileset {
         let v0 = row as f32 * self.tile_height as f32 / self.image_height as f32;
         let u1 = u0 + self.tile_width as f32 / self.image_width as f32;
         let v1 = v0 + self.tile_height as f32 / self.image_height as f32;
+
+        [
+            Vec2::new(u0, v1), // bottom-left
+            Vec2::new(u1, v1), // bottom-right
+            Vec2::new(u1, v0), // top-right
+            Vec2::new(u0, v0), // top-left
+        ]
+    }
+
+    /// Compute UV coordinates spanning a rectangular region of tiles.
+    /// (col0, row0) is the top-left tile, (col1, row1) is the bottom-right tile (inclusive).
+    pub fn tile_region_uvs(&self, col0: u32, row0: u32, col1: u32, row1: u32) -> [Vec2; 4] {
+        let u0 = col0 as f32 * self.tile_width as f32 / self.image_width as f32;
+        let v0 = row0 as f32 * self.tile_height as f32 / self.image_height as f32;
+        let u1 = (col1 + 1) as f32 * self.tile_width as f32 / self.image_width as f32;
+        let v1 = (row1 + 1) as f32 * self.tile_height as f32 / self.image_height as f32;
 
         [
             Vec2::new(u0, v1), // bottom-left
@@ -109,6 +131,8 @@ impl Tileset {
             ],
         });
 
+        let image_data = img.into_raw();
+
         Ok(Self {
             name: path
                 .file_stem()
@@ -120,6 +144,70 @@ impl Tileset {
             tile_height,
             gpu_texture: Some(texture),
             bind_group: Some(bind_group),
+            egui_texture_id: None,
+            image_data: Some(image_data),
         })
+    }
+
+    /// Register this tileset's image with the egui renderer for UI display.
+    /// Must be called after load() and before the first frame that needs to display the tileset.
+    pub fn register_with_egui(
+        &mut self,
+        egui_renderer: &mut egui_wgpu::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        if self.egui_texture_id.is_some() {
+            return; // Already registered
+        }
+
+        let Some(ref image_data) = self.image_data else { return };
+
+        // Create a separate texture for egui display
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tileset_egui_texture"),
+            size: wgpu::Extent3d {
+                width: self.image_width,
+                height: self.image_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload image data
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            image_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * self.image_width),
+                rows_per_image: Some(self.image_height),
+            },
+            wgpu::Extent3d {
+                width: self.image_width,
+                height: self.image_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&Default::default());
+
+        let id = egui_renderer.register_native_texture(
+            device,
+            &view,
+            wgpu::FilterMode::Nearest,
+        );
+
+        self.egui_texture_id = Some(id);
     }
 }

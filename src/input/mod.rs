@@ -12,9 +12,15 @@ pub struct InputState {
     /// True for one frame when button first pressed
     pub left_just_clicked: bool,
     pub right_just_clicked: bool,
+    /// True for one frame when left button released
+    pub left_just_released: bool,
     pub scroll_delta: f32,
     pub keys_held: std::collections::HashSet<KeyCode>,
     pub keys_just_pressed: std::collections::HashSet<KeyCode>,
+    /// Start position of a left-button drag
+    pub drag_start: Option<Vec2>,
+    /// True when dragging (left pressed and moved > 5px from drag_start)
+    pub is_dragging: bool,
 }
 
 impl InputState {
@@ -27,9 +33,12 @@ impl InputState {
             middle_pressed: false,
             left_just_clicked: false,
             right_just_clicked: false,
+            left_just_released: false,
             scroll_delta: 0.0,
             keys_held: std::collections::HashSet::new(),
             keys_just_pressed: std::collections::HashSet::new(),
+            drag_start: None,
+            is_dragging: false,
         }
     }
 
@@ -39,7 +48,13 @@ impl InputState {
         self.scroll_delta = 0.0;
         self.left_just_clicked = false;
         self.right_just_clicked = false;
+        self.left_just_released = false;
         self.keys_just_pressed.clear();
+        // Clear drag state when left button not pressed
+        if !self.left_pressed {
+            self.drag_start = None;
+            self.is_dragging = false;
+        }
     }
 
     pub fn handle_event(&mut self, event: &WindowEvent) {
@@ -48,6 +63,13 @@ impl InputState {
                 let new_pos = Vec2::new(position.x as f32, position.y as f32);
                 self.mouse_delta = new_pos - self.mouse_pos;
                 self.mouse_pos = new_pos;
+                // Detect drag when left pressed and moved > 5px
+                if self.left_pressed && !self.is_dragging
+                    && let Some(start) = self.drag_start
+                    && new_pos.distance(start) > 5.0
+                {
+                    self.is_dragging = true;
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = *state == ElementState::Pressed;
@@ -55,6 +77,10 @@ impl InputState {
                     MouseButton::Left => {
                         if pressed && !self.left_pressed {
                             self.left_just_clicked = true;
+                            self.drag_start = Some(self.mouse_pos);
+                        }
+                        if !pressed && self.left_pressed {
+                            self.left_just_released = true;
                         }
                         self.left_pressed = pressed;
                     }

@@ -1,13 +1,16 @@
+use serde::{Serialize, Deserialize};
 use wgpu::util::DeviceExt;
-use crate::render::Vertex;
 use crate::scene::mesh::Face;
 
 /// A collection of tile faces that share a single draw call.
+#[derive(Serialize, Deserialize)]
 pub struct Object {
     pub name: String,
     pub faces: Vec<Face>,
+    #[serde(skip)]
     pub gpu_mesh: Option<GpuMesh>,
-    pub tileset_bind_group: Option<wgpu::BindGroup>,
+    /// Index into Scene.tilesets for this object's texture. None = use placeholder.
+    pub tileset_index: Option<usize>,
 }
 
 pub struct GpuMesh {
@@ -22,7 +25,7 @@ impl Object {
             name,
             faces: Vec::new(),
             gpu_mesh: None,
-            tileset_bind_group: None,
+            tileset_index: None,
         }
     }
 
@@ -37,6 +40,7 @@ impl Object {
         let mut indices = Vec::with_capacity(self.faces.len() * 6);
 
         for face in &self.faces {
+            if face.hidden { continue; }
             let base = vertices.len() as u32;
             vertices.extend_from_slice(&face.vertices());
             indices.extend_from_slice(&Face::indices(base));

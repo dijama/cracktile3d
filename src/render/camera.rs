@@ -6,6 +6,12 @@ pub enum Projection {
     Orthographic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraMode {
+    Orbit,
+    Freelook,
+}
+
 pub struct Camera {
     pub position: Vec3,
     pub target: Vec3,
@@ -21,6 +27,10 @@ pub struct Camera {
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,
+
+    // Freelook
+    pub mode: CameraMode,
+    pub freelook_speed: f32,
 }
 
 impl Camera {
@@ -44,6 +54,8 @@ impl Camera {
             yaw,
             pitch,
             distance,
+            mode: CameraMode::Orbit,
+            freelook_speed: 0.1,
         }
     }
 
@@ -110,6 +122,93 @@ impl Camera {
             Projection::Perspective => Projection::Orthographic,
             Projection::Orthographic => Projection::Perspective,
         };
+    }
+
+    /// Front view: looking along -Z
+    pub fn set_view_front(&mut self) {
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.update_position();
+    }
+
+    /// Back view: looking along +Z
+    pub fn set_view_back(&mut self) {
+        self.yaw = std::f32::consts::PI;
+        self.pitch = 0.0;
+        self.update_position();
+    }
+
+    /// Right view: looking along -X
+    pub fn set_view_right(&mut self) {
+        self.yaw = -std::f32::consts::FRAC_PI_2;
+        self.pitch = 0.0;
+        self.update_position();
+    }
+
+    /// Left view: looking along +X
+    pub fn set_view_left(&mut self) {
+        self.yaw = std::f32::consts::FRAC_PI_2;
+        self.pitch = 0.0;
+        self.update_position();
+    }
+
+    /// Top view: looking down along -Y
+    pub fn set_view_top(&mut self) {
+        self.yaw = 0.0;
+        self.pitch = 89.0_f32.to_radians();
+        self.update_position();
+    }
+
+    /// Bottom view: looking up along +Y
+    pub fn set_view_bottom(&mut self) {
+        self.yaw = 0.0;
+        self.pitch = -89.0_f32.to_radians();
+        self.update_position();
+    }
+
+    /// Center the camera orbit on a given target point.
+    pub fn center_on(&mut self, target: Vec3) {
+        self.target = target;
+        self.update_position();
+    }
+
+    /// Enter freelook (FPS) camera mode, preserving current position and direction.
+    pub fn enter_freelook(&mut self) {
+        self.mode = CameraMode::Freelook;
+    }
+
+    /// Exit freelook mode, recalculating orbit parameters from current position.
+    pub fn exit_freelook(&mut self) {
+        self.mode = CameraMode::Orbit;
+        let diff = self.position - self.target;
+        self.distance = diff.length().max(0.5);
+        self.pitch = (diff.y / self.distance).asin();
+        self.yaw = diff.x.atan2(diff.z);
+    }
+
+    /// Move in freelook mode by camera-relative directions.
+    pub fn freelook_move(&mut self, forward: f32, right: f32, up: f32) {
+        let dir = (self.target - self.position).normalize();
+        let right_vec = dir.cross(self.up).normalize();
+        let offset = dir * forward * self.freelook_speed
+            + right_vec * right * self.freelook_speed
+            + Vec3::Y * up * self.freelook_speed;
+        self.position += offset;
+        self.target += offset;
+    }
+
+    /// Rotate the camera in freelook mode (mouse look).
+    pub fn freelook_look(&mut self, dx: f32, dy: f32) {
+        self.yaw += dx;
+        self.pitch = (self.pitch - dy).clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+
+        // Recompute target from position + direction
+        let dir_x = self.pitch.cos() * self.yaw.sin();
+        let dir_y = self.pitch.sin();
+        let dir_z = self.pitch.cos() * self.yaw.cos();
+        // In orbit mode, position = target + offset. In freelook, target = position - offset direction
+        // We want target in front of position: target = position - direction_from_target_to_position
+        self.target = self.position - Vec3::new(dir_x, dir_y, dir_z) * self.distance;
     }
 
     fn update_position(&mut self) {

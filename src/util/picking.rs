@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4Swizzles};
 
 /// A ray in 3D space with origin and direction.
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +107,20 @@ impl Ray {
     }
 }
 
+/// Project a 3D point to 2D screen coordinates.
+/// Returns None if the point is behind the camera.
+pub fn project_to_screen(pos: Vec3, view_proj: Mat4, screen_size: Vec2) -> Option<Vec2> {
+    let clip = view_proj * pos.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = clip.xyz() / clip.w;
+    Some(Vec2::new(
+        (ndc.x + 1.0) * 0.5 * screen_size.x,
+        (1.0 - ndc.y) * 0.5 * screen_size.y,
+    ))
+}
+
 /// Pick the closest face in the scene hit by a screen-space ray.
 pub fn pick_face(
     ray: &Ray,
@@ -120,6 +134,7 @@ pub fn pick_face(
         }
         for (oi, object) in layer.objects.iter().enumerate() {
             for (fi, face) in object.faces.iter().enumerate() {
+                if face.hidden { continue; }
                 if let Some(t) = ray.intersect_quad(&face.positions) {
                     let dominated = closest.as_ref().is_some_and(|c| c.distance <= t);
                     if !dominated {
