@@ -4,6 +4,378 @@ use crate::scene::mesh::Face;
 use crate::scene::{Object, Scene};
 use crate::tools::draw::default_uvs;
 
+/// Hide selected faces (undoable).
+pub struct HideFaces {
+    pub faces: Vec<(usize, usize, usize)>,
+}
+
+impl Command for HideFaces {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi) in &self.faces {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.hidden = true;
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi) in &self.faces {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.hidden = false;
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Hide Faces"
+    }
+}
+
+/// Show all hidden faces (undoable). Stores which faces were hidden for undo.
+pub struct ShowAllFaces {
+    pub previously_hidden: Vec<(usize, usize, usize)>,
+}
+
+impl Command for ShowAllFaces {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi) in &self.previously_hidden {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.hidden = false;
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi) in &self.previously_hidden {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.hidden = true;
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Show All Faces"
+    }
+}
+
+/// Edit a face's properties (positions, UVs, colors) with undo support.
+pub struct EditFaceProperty {
+    pub face: (usize, usize, usize),
+    pub old_positions: [Vec3; 4],
+    pub old_uvs: [Vec2; 4],
+    pub old_colors: [Vec4; 4],
+    pub new_positions: [Vec3; 4],
+    pub new_uvs: [Vec2; 4],
+    pub new_colors: [Vec4; 4],
+}
+
+impl Command for EditFaceProperty {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let (li, oi, fi) = self.face;
+        if let Some(face) = scene.layers.get_mut(li)
+            .and_then(|l| l.objects.get_mut(oi))
+            .and_then(|o| o.faces.get_mut(fi))
+        {
+            face.positions = self.new_positions;
+            face.uvs = self.new_uvs;
+            face.colors = self.new_colors;
+        }
+        scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let (li, oi, fi) = self.face;
+        if let Some(face) = scene.layers.get_mut(li)
+            .and_then(|l| l.objects.get_mut(oi))
+            .and_then(|o| o.faces.get_mut(fi))
+        {
+            face.positions = self.old_positions;
+            face.uvs = self.old_uvs;
+            face.colors = self.old_colors;
+        }
+        scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+    }
+
+    fn description(&self) -> &str {
+        "Edit Face Property"
+    }
+}
+
+/// Manipulate UVs of selected faces (rotate, flip).
+pub struct ManipulateUVs {
+    pub faces: Vec<(usize, usize, usize)>,
+    pub old_uvs: Vec<[Vec2; 4]>,
+    pub new_uvs: Vec<[Vec2; 4]>,
+}
+
+impl Command for ManipulateUVs {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for (i, &(li, oi, fi)) in self.faces.iter().enumerate() {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.uvs = self.new_uvs[i];
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for (i, &(li, oi, fi)) in self.faces.iter().enumerate() {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.uvs = self.old_uvs[i];
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Manipulate UVs"
+    }
+}
+
+/// Merge vertices by moving them to new positions.
+pub struct MergeVertices {
+    pub moves: Vec<(usize, usize, usize, usize, Vec3, Vec3)>, // (li, oi, fi, vi, old_pos, new_pos)
+}
+
+impl Command for MergeVertices {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi, vi, _, new_pos) in &self.moves {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.positions[vi] = new_pos;
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi, vi, old_pos, _) in &self.moves {
+            if let Some(face) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.faces.get_mut(fi))
+            {
+                face.positions[vi] = old_pos;
+                rebuild.insert((li, oi));
+            }
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Merge Vertices"
+    }
+}
+
+/// Split an edge, turning one quad into two quads.
+pub struct SplitEdge {
+    pub targets: Vec<(usize, usize, usize, usize)>, // (li, oi, fi, edge_idx)
+    original_faces: Vec<(usize, usize, usize, Face)>,
+    added_per_object: Vec<(usize, usize, usize)>, // (li, oi, count)
+}
+
+impl SplitEdge {
+    pub fn new(targets: Vec<(usize, usize, usize, usize)>) -> Self {
+        Self { targets, original_faces: Vec::new(), added_per_object: Vec::new() }
+    }
+}
+
+impl Command for SplitEdge {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        self.original_faces.clear();
+        self.added_per_object.clear();
+        let mut adds_per_obj: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+
+        // Process in reverse face order to avoid index shifting
+        let mut sorted = self.targets.clone();
+        sorted.sort_by(|a, b| b.2.cmp(&a.2));
+
+        for &(li, oi, fi, edge_idx) in &sorted {
+            let face = scene.layers[li].objects[oi].faces[fi].clone();
+            self.original_faces.push((li, oi, fi, face.clone()));
+
+            let p = face.positions;
+            let uv = face.uvs;
+            let c = face.colors;
+            let e = edge_idx;
+            let en = (e + 1) % 4;
+            let opp = (e + 2) % 4;
+            let oppn = (e + 3) % 4;
+
+            // Midpoint on the selected edge
+            let mid_p = (p[e] + p[en]) * 0.5;
+            let mid_uv = (uv[e] + uv[en]) * 0.5;
+            let mid_c = (c[e] + c[en]) * 0.5;
+
+            // Midpoint on the opposite edge
+            let mid_opp_p = (p[opp] + p[oppn]) * 0.5;
+            let mid_opp_uv = (uv[opp] + uv[oppn]) * 0.5;
+            let mid_opp_c = (c[opp] + c[oppn]) * 0.5;
+
+            // Two new quads
+            let face_a = Face {
+                positions: [p[e], mid_p, mid_opp_p, p[oppn]],
+                uvs: [uv[e], mid_uv, mid_opp_uv, uv[oppn]],
+                colors: [c[e], mid_c, mid_opp_c, c[oppn]],
+                hidden: false,
+            };
+            let face_b = Face {
+                positions: [mid_p, p[en], p[opp], mid_opp_p],
+                uvs: [mid_uv, uv[en], uv[opp], mid_opp_uv],
+                colors: [mid_c, c[en], c[opp], mid_opp_c],
+                hidden: false,
+            };
+
+            scene.layers[li].objects[oi].faces.remove(fi);
+            scene.layers[li].objects[oi].faces.push(face_a);
+            scene.layers[li].objects[oi].faces.push(face_b);
+            *adds_per_obj.entry((li, oi)).or_insert(0) += 2;
+        }
+
+        for ((li, oi), count) in &adds_per_obj {
+            self.added_per_object.push((*li, *oi, *count));
+        }
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, _, _) in &self.targets {
+            rebuild.insert((li, oi));
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        // Remove added faces
+        for &(li, oi, count) in &self.added_per_object {
+            for _ in 0..count {
+                scene.layers[li].objects[oi].faces.pop();
+            }
+        }
+
+        // Re-insert original faces (stored in reverse order, so insert in reverse)
+        for (li, oi, fi, face) in self.original_faces.iter().rev() {
+            scene.layers[*li].objects[*oi].faces.insert(*fi, face.clone());
+        }
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, _, _) in &self.targets {
+            rebuild.insert((li, oi));
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Split Edge"
+    }
+}
+
+/// Collapse an edge by merging its two vertices to their midpoint.
+pub struct CollapseEdge {
+    pub targets: Vec<(usize, usize, usize, usize)>, // (li, oi, fi, edge_idx)
+    old_positions: Vec<(usize, usize, usize, [Vec3; 4])>,
+}
+
+impl CollapseEdge {
+    pub fn new(targets: Vec<(usize, usize, usize, usize)>) -> Self {
+        Self { targets, old_positions: Vec::new() }
+    }
+}
+
+impl Command for CollapseEdge {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        self.old_positions.clear();
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+
+        for &(li, oi, fi, edge_idx) in &self.targets {
+            let face = &scene.layers[li].objects[oi].faces[fi];
+            self.old_positions.push((li, oi, fi, face.positions));
+
+            let en = (edge_idx + 1) % 4;
+            let mid = (face.positions[edge_idx] + face.positions[en]) * 0.5;
+            let face = &mut scene.layers[li].objects[oi].faces[fi];
+            face.positions[edge_idx] = mid;
+            face.positions[en] = mid;
+            rebuild.insert((li, oi));
+        }
+
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi, positions) in &self.old_positions {
+            scene.layers[li].objects[oi].faces[fi].positions = positions;
+            rebuild.insert((li, oi));
+        }
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Collapse Edge"
+    }
+}
+
 /// Place one or more tile faces into a specific layer/object.
 pub struct PlaceTile {
     pub layer: usize,

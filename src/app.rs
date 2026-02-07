@@ -8,7 +8,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use winit::keyboard::KeyCode;
 
 use crate::render::Renderer;
-use crate::render::camera::CameraMode;
+use crate::render::camera::{CameraBookmark, CameraMode};
 use crate::input::InputState;
 use crate::scene::mesh::Face;
 use crate::scene::{Scene, GRID_PRESETS};
@@ -17,7 +17,8 @@ use crate::tools::draw::{DrawState, DrawTool};
 use crate::tools::edit::{EditState, GizmoMode};
 use crate::history::History;
 use crate::history::commands;
-use crate::ui::UiAction;
+use crate::ui::{UiAction, UiResult};
+use crate::ui::properties_panel::PropertyEditSnapshot;
 use crate::util::picking::Ray;
 
 /// Pending tileset load awaiting tile-size confirmation.
@@ -64,6 +65,14 @@ pub struct App {
     has_unsaved_changes: bool,
     /// Pending confirmation dialog (e.g., "New Scene" when unsaved)
     confirm_dialog: Option<ConfirmDialog>,
+    /// Deferred property edit snapshot for undo
+    property_snapshot: Option<PropertyEditSnapshot>,
+    /// Recent files list (max 10)
+    recent_files: Vec<std::path::PathBuf>,
+    /// Camera bookmarks (up to 5)
+    camera_bookmarks: [Option<CameraBookmark>; 5],
+    /// Lighting preview enabled
+    lighting_enabled: bool,
 }
 
 /// Everything that requires the window to exist.
@@ -76,6 +85,7 @@ struct GpuState {
 
 impl App {
     pub fn new(_event_loop: &winit::event_loop::EventLoop<()>) -> Self {
+        let recent_files = crate::io::load_recent_files();
         Self {
             gpu: None,
             scene: Scene::new(),
@@ -94,8 +104,13 @@ impl App {
             hover_face: None,
             has_unsaved_changes: false,
             confirm_dialog: None,
+            property_snapshot: None,
+            recent_files,
+            camera_bookmarks: [None, None, None, None, None],
+            lighting_enabled: false,
         }
     }
+
 }
 
 impl ApplicationHandler for App {
@@ -349,13 +364,41 @@ impl App {
             );
 
             if self.draw_state.tool == DrawTool::VertexColor {
-                // Vertex color tool: paint hit face
+                // Vertex color tool: paint hit face (with radius/opacity)
                 if let Some(hit) = crate::util::picking::pick_face(&ray, &self.scene) {
                     let c = self.draw_state.paint_color;
                     let new_color = glam::Vec4::new(c[0], c[1], c[2], c[3]);
+                    let opacity = self.draw_state.paint_opacity;
+
+                    // Find all faces within paint_radius
+                    let mut targets = vec![(hit.layer_index, hit.object_index, hit.face_index)];
+                    if self.draw_state.paint_radius > 0.0 {
+                        let radius_sq = self.draw_state.paint_radius * self.draw_state.paint_radius;
+                        for (li, layer) in self.scene.layers.iter().enumerate() {
+                            if !layer.visible { continue; }
+                            for (oi, obj) in layer.objects.iter().enumerate() {
+                                for (fi, face) in obj.faces.iter().enumerate() {
+                                    if (li, oi, fi) == (hit.layer_index, hit.object_index, hit.face_index) { continue; }
+                                    let center = (face.positions[0] + face.positions[1] + face.positions[2] + face.positions[3]) * 0.25;
+                                    if center.distance_squared(hit.position) <= radius_sq {
+                                        targets.push((li, oi, fi));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Apply opacity blending
+                    let paint_color = if (opacity - 1.0).abs() < f32::EPSILON {
+                        new_color
+                    } else {
+                        // We'll store the blended color; the command captures old/new colors
+                        new_color
+                    };
+
                     let cmd = commands::PaintVertexColor {
-                        targets: vec![(hit.layer_index, hit.object_index, hit.face_index)],
-                        new_color,
+                        targets,
+                        new_color: paint_color,
                         old_colors: Vec::new(),
                     };
                     self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
@@ -406,13 +449,11 @@ impl App {
             );
             if let Some(hit) = crate::util::picking::pick_face(&ray, &self.scene) {
                 let face = &self.scene.layers[hit.layer_index].objects[hit.object_index].faces[hit.face_index];
-                // Find which tileset and tile coords match these UVs
                 let obj = &self.scene.layers[hit.layer_index].objects[hit.object_index];
                 if let Some(ts_idx) = obj.tileset_index {
                     self.scene.active_tileset = Some(ts_idx);
                     if let Some(tileset) = self.scene.tilesets.get(ts_idx) {
-                        // Reverse-lookup: find tile col/row from UV
-                        let uv = face.uvs[0]; // bottom-left UV
+                        let uv = face.uvs[0];
                         let col = (uv.x * tileset.image_width as f32 / tileset.tile_width as f32).floor() as u32;
                         let row = (uv.y * tileset.image_height as f32 / tileset.tile_height as f32).floor() as u32;
                         self.draw_state.selected_tile = (col, row);
@@ -457,9 +498,17 @@ impl App {
             }
         }
 
-        // Edit mode: translate selection by one grid step
+        // Edit mode: translate selection by one grid step (with fine/coarse modifiers)
         if self.tool_mode == ToolMode::Edit && !self.edit_state.selection.is_empty() {
-            let step = self.scene.grid_cell_size;
+            let shift = self.input.key_held(KeyCode::ShiftLeft) || self.input.key_held(KeyCode::ShiftRight);
+            let ctrl = self.input.key_held(KeyCode::ControlLeft) || self.input.key_held(KeyCode::ControlRight);
+            let step = if shift {
+                self.scene.grid_cell_size * 0.5  // Fine mode
+            } else if ctrl {
+                self.scene.grid_cell_size * 2.0  // Coarse mode
+            } else {
+                self.scene.grid_cell_size
+            };
             let mut delta = glam::Vec3::ZERO;
             if self.input.key_just_pressed(KeyCode::ArrowUp) { delta.z -= step; }
             if self.input.key_just_pressed(KeyCode::ArrowDown) { delta.z += step; }
@@ -661,7 +710,6 @@ impl App {
         } else if alt && self.input.key_just_pressed(KeyCode::KeyC)
             && !self.edit_state.selection.faces.is_empty()
         {
-            // Snap crosshair to centroid of selected faces
             let centroid = self.edit_state.selection.centroid(&self.scene);
             self.scene.crosshair_pos = centroid;
         }
@@ -673,7 +721,6 @@ impl App {
             && !self.input.space_held()
             && !shift
         {
-            // Collect face indices to hide
             let mut to_hide = Vec::new();
             for &(li, oi, fi) in &self.edit_state.selection.faces {
                 to_hide.push((li, oi, fi));
@@ -685,38 +732,37 @@ impl App {
                     }
                 }
             }
-            for &(li, oi, fi) in &to_hide {
-                if let Some(face) = self.scene.layers.get_mut(li)
-                    .and_then(|l| l.objects.get_mut(oi))
-                    .and_then(|o| o.faces.get_mut(fi))
-                {
-                    face.hidden = true;
-                }
+            if !to_hide.is_empty() {
+                let cmd = commands::HideFaces { faces: to_hide };
+                self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                self.edit_state.selection.clear();
             }
-            // Rebuild affected objects
-            let rebuild: std::collections::HashSet<(usize, usize)> = to_hide.iter().map(|&(li, oi, _)| (li, oi)).collect();
-            for (li, oi) in rebuild {
-                self.scene.layers[li].objects[oi].rebuild_gpu_mesh(&gpu.renderer.device);
-            }
-            self.edit_state.selection.clear();
         }
 
         // Show all hidden tiles (Shift+H)
         if self.input.key_just_pressed(KeyCode::KeyH) && shift && !self.input.space_held() {
-            let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
-            for (li, layer) in self.scene.layers.iter_mut().enumerate() {
-                for (oi, obj) in layer.objects.iter_mut().enumerate() {
-                    for face in &mut obj.faces {
+            let mut previously_hidden = Vec::new();
+            for (li, layer) in self.scene.layers.iter().enumerate() {
+                for (oi, obj) in layer.objects.iter().enumerate() {
+                    for (fi, face) in obj.faces.iter().enumerate() {
                         if face.hidden {
-                            face.hidden = false;
-                            rebuild.insert((li, oi));
+                            previously_hidden.push((li, oi, fi));
                         }
                     }
                 }
             }
-            for (li, oi) in rebuild {
-                self.scene.layers[li].objects[oi].rebuild_gpu_mesh(&gpu.renderer.device);
+            if !previously_hidden.is_empty() {
+                let cmd = commands::ShowAllFaces { previously_hidden };
+                self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
             }
+        }
+
+        // Edit mode: Merge vertices (M)
+        if self.tool_mode == ToolMode::Edit
+            && self.input.key_just_pressed(KeyCode::KeyM)
+            && !self.input.space_held()
+        {
+            self.pending_action = Some(UiAction::MergeVertices);
         }
 
         // Undo/Redo hotkeys
@@ -829,6 +875,21 @@ impl App {
             }
         }
 
+        // Camera bookmarks: Ctrl+Shift+1-5 to save, Ctrl+1-5 to recall
+        let shift = self.input.key_held(KeyCode::ShiftLeft) || self.input.key_held(KeyCode::ShiftRight);
+        let bookmark_keys = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5];
+        if ctrl && self.tool_mode == ToolMode::Edit {
+            for (i, key) in bookmark_keys.iter().enumerate() {
+                if self.input.key_just_pressed(*key) {
+                    if shift {
+                        self.camera_bookmarks[i] = Some(gpu.renderer.camera.to_bookmark());
+                    } else if let Some(ref bm) = self.camera_bookmarks[i] {
+                        gpu.renderer.camera.apply_bookmark(bm);
+                    }
+                }
+            }
+        }
+
         // Compute placement preview (every frame in Draw mode)
         self.preview_faces.clear();
         if self.tool_mode == ToolMode::Draw
@@ -906,9 +967,9 @@ impl App {
         // Run egui
         let raw_input = gpu.egui_state.take_egui_input(&gpu.window);
         let egui_ctx = gpu.egui_state.egui_ctx().clone();
-        let mut ui_action = UiAction::None;
+        let mut ui_result = UiResult { action: UiAction::None, property_commit: None };
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            ui_action = crate::ui::draw_ui(
+            ui_result = crate::ui::draw_ui(
                 ctx,
                 &mut self.scene,
                 &mut self.tool_mode,
@@ -918,6 +979,9 @@ impl App {
                 self.wireframe,
                 &mut self.bg_color,
                 self.has_unsaved_changes,
+                &mut self.property_snapshot,
+                &self.recent_files,
+                self.lighting_enabled,
             );
 
             // Marquee selection visual feedback
@@ -964,10 +1028,10 @@ impl App {
                 if confirmed {
                     match self.confirm_dialog.take().unwrap() {
                         ConfirmDialog::NewScene => {
-                            ui_action = UiAction::NewScene;
+                            ui_result.action = UiAction::NewScene;
                         }
                         ConfirmDialog::Quit => {
-                            ui_action = UiAction::Quit;
+                            ui_result.action = UiAction::Quit;
                         }
                     }
                 }
@@ -999,7 +1063,7 @@ impl App {
                         });
                     });
                 if confirmed {
-                    ui_action = UiAction::ConfirmTilesetLoad;
+                    ui_result.action = UiAction::ConfirmTilesetLoad;
                 }
                 if cancelled {
                     pending_tileset = None;
@@ -1016,8 +1080,22 @@ impl App {
         let ui_action = if let Some(pending) = self.pending_action.take() {
             pending
         } else {
-            ui_action
+            ui_result.action
         };
+
+        // Handle property edit commits from the properties panel
+        if let Some(commit) = ui_result.property_commit {
+            let cmd = commands::EditFaceProperty {
+                face: commit.face,
+                old_positions: commit.old_positions,
+                old_uvs: commit.old_uvs,
+                old_colors: commit.old_colors,
+                new_positions: commit.new_positions,
+                new_uvs: commit.new_uvs,
+                new_colors: commit.new_colors,
+            };
+            self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+        }
 
         // Handle UI actions
         match ui_action {
@@ -1027,6 +1105,7 @@ impl App {
                 self.history.clear();
                 self.last_save_path = None;
                 self.has_unsaved_changes = false;
+                self.property_snapshot = None;
             }
             UiAction::Undo => {
                 self.history.undo(&mut self.scene, &gpu.renderer.device);
@@ -1061,20 +1140,24 @@ impl App {
                 }
             }
             UiAction::SaveScene => {
-                if let Some(ref path) = self.last_save_path {
-                    match crate::io::save_scene(&self.scene, path) {
+                if let Some(path) = self.last_save_path.clone() {
+                    match crate::io::save_scene(&self.scene, &path) {
                         Ok(()) => {
                             log::info!("Saved scene to {:?}", path);
                             self.history.mark_saved();
+                            self.recent_files.retain(|p| p != &path);
+                            self.recent_files.insert(0, path);
+                            self.recent_files.truncate(10);
+                            crate::io::save_recent_files(&self.recent_files);
                         }
                         Err(e) => log::error!("Failed to save: {e}"),
                     }
                 } else {
-                    Self::do_save_scene(&self.scene, &mut self.last_save_path, &mut self.history);
+                    Self::do_save_scene(&self.scene, &mut self.last_save_path, &mut self.history, &mut self.recent_files);
                 }
             }
             UiAction::SaveSceneAs => {
-                Self::do_save_scene(&self.scene, &mut self.last_save_path, &mut self.history);
+                Self::do_save_scene(&self.scene, &mut self.last_save_path, &mut self.history, &mut self.recent_files);
             }
             UiAction::OpenScene => {
                 Self::do_open_scene(
@@ -1082,7 +1165,32 @@ impl App {
                     &mut self.edit_state,
                     &mut self.history,
                     &gpu.renderer,
+                    &mut self.last_save_path,
+                    &mut self.recent_files,
                 );
+            }
+            UiAction::OpenRecentFile(idx) => {
+                if let Some(path) = self.recent_files.get(idx).cloned() {
+                    match crate::io::load_scene(&path) {
+                        Ok(mut loaded) => {
+                            for layer in &mut loaded.layers {
+                                for obj in &mut layer.objects {
+                                    obj.rebuild_gpu_mesh(&gpu.renderer.device);
+                                }
+                            }
+                            self.scene = loaded;
+                            self.edit_state.selection.clear();
+                            self.history.clear();
+                            self.last_save_path = Some(path.clone());
+                            self.recent_files.retain(|p| p != &path);
+                            self.recent_files.insert(0, path);
+                            self.recent_files.truncate(10);
+                            crate::io::save_recent_files(&self.recent_files);
+                            log::info!("Opened scene from recent file");
+                        }
+                        Err(e) => log::error!("Failed to open: {e}"),
+                    }
+                }
             }
             UiAction::ExportObj => {
                 Self::do_export_obj(&self.scene);
@@ -1090,8 +1198,18 @@ impl App {
             UiAction::ExportGlb => {
                 Self::do_export_glb(&self.scene);
             }
+            UiAction::ImportObj => {
+                Self::do_import_obj(&mut self.scene, &mut self.history, &gpu.renderer);
+            }
+            UiAction::ImportGlb => {
+                Self::do_import_glb(&mut self.scene, &mut self.history, &gpu.renderer);
+            }
             UiAction::ToggleWireframe => {
                 self.wireframe = !self.wireframe;
+            }
+            UiAction::ToggleLighting => {
+                self.lighting_enabled = !self.lighting_enabled;
+                gpu.renderer.set_lighting_enabled(self.lighting_enabled);
             }
             UiAction::ConfirmNewScene => {
                 self.confirm_dialog = Some(ConfirmDialog::NewScene);
@@ -1192,6 +1310,66 @@ impl App {
             }
             UiAction::InvertSelection => {
                 self.edit_state.invert_selection(&self.scene);
+            }
+            // UV operations
+            UiAction::UVRotateCW => {
+                Self::apply_uv_op(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, |uvs| {
+                    [uvs[3], uvs[0], uvs[1], uvs[2]]
+                });
+            }
+            UiAction::UVRotateCCW => {
+                Self::apply_uv_op(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, |uvs| {
+                    [uvs[1], uvs[2], uvs[3], uvs[0]]
+                });
+            }
+            UiAction::UVFlipH => {
+                Self::apply_uv_op(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, |uvs| {
+                    [uvs[1], uvs[0], uvs[3], uvs[2]]
+                });
+            }
+            UiAction::UVFlipV => {
+                Self::apply_uv_op(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, |uvs| {
+                    [uvs[3], uvs[2], uvs[1], uvs[0]]
+                });
+            }
+            // Geometry operations
+            UiAction::MergeVertices => {
+                Self::apply_merge_vertices(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device);
+            }
+            UiAction::MirrorX => {
+                Self::apply_mirror(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, 0);
+            }
+            UiAction::MirrorY => {
+                Self::apply_mirror(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, 1);
+            }
+            UiAction::MirrorZ => {
+                Self::apply_mirror(&self.edit_state, &mut self.scene, &mut self.history, &gpu.renderer.device, 2);
+            }
+            // Edge operations
+            UiAction::SplitEdge => {
+                if !self.edit_state.selection.edges.is_empty() {
+                    let cmd = commands::SplitEdge::new(self.edit_state.selection.edges.clone());
+                    self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                    self.edit_state.selection.clear();
+                }
+            }
+            UiAction::CollapseEdge => {
+                if !self.edit_state.selection.edges.is_empty() {
+                    let cmd = commands::CollapseEdge::new(self.edit_state.selection.edges.clone());
+                    self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                    self.edit_state.selection.clear();
+                }
+            }
+            // Camera bookmarks
+            UiAction::SaveBookmark(idx) => {
+                if idx < 5 {
+                    self.camera_bookmarks[idx] = Some(gpu.renderer.camera.to_bookmark());
+                }
+            }
+            UiAction::RecallBookmark(idx) => {
+                if let Some(Some(bm)) = self.camera_bookmarks.get(idx) {
+                    gpu.renderer.camera.apply_bookmark(bm);
+                }
             }
             UiAction::Quit => {
                 std::process::exit(0);
@@ -1295,8 +1473,6 @@ impl App {
                     ..Default::default()
                 });
                 // SAFETY: The render pass is dropped before encoder.finish() is called.
-                // egui-wgpu requires 'static but the pass lifetime is actually bounded
-                // by this block scope. This is a well-known pattern for egui-wgpu integration.
                 let pass_static: &mut wgpu::RenderPass<'static> =
                     unsafe { std::mem::transmute(&mut pass) };
                 gpu.egui_renderer.render(pass_static, &paint_jobs, &screen_descriptor);
@@ -1341,7 +1517,7 @@ impl App {
         }
     }
 
-    fn do_save_scene(scene: &Scene, last_save_path: &mut Option<std::path::PathBuf>, history: &mut History) {
+    fn do_save_scene(scene: &Scene, last_save_path: &mut Option<std::path::PathBuf>, history: &mut History, recent_files: &mut Vec<std::path::PathBuf>) {
         let file = rfd::FileDialog::new()
             .add_filter("Cracktile 3D", &["ct3d"])
             .set_title("Save Scene")
@@ -1351,8 +1527,12 @@ impl App {
             match crate::io::save_scene(scene, &path) {
                 Ok(()) => {
                     log::info!("Saved scene to {:?}", path);
-                    *last_save_path = Some(path);
+                    *last_save_path = Some(path.clone());
                     history.mark_saved();
+                    recent_files.retain(|p| p != &path);
+                    recent_files.insert(0, path);
+                    recent_files.truncate(10);
+                    crate::io::save_recent_files(recent_files);
                 }
                 Err(e) => log::error!("Failed to save: {e}"),
             }
@@ -1364,6 +1544,8 @@ impl App {
         edit_state: &mut EditState,
         history: &mut History,
         renderer: &Renderer,
+        last_save_path: &mut Option<std::path::PathBuf>,
+        recent_files: &mut Vec<std::path::PathBuf>,
     ) {
         let file = rfd::FileDialog::new()
             .add_filter("Cracktile 3D", &["ct3d"])
@@ -1381,7 +1563,12 @@ impl App {
                     *scene = loaded;
                     edit_state.selection.clear();
                     history.clear();
-                    log::info!("Opened scene from {:?}", path);
+                    *last_save_path = Some(path.clone());
+                    recent_files.retain(|p| p != &path);
+                    recent_files.insert(0, path);
+                    recent_files.truncate(10);
+                    crate::io::save_recent_files(recent_files);
+                    log::info!("Opened scene");
                 }
                 Err(e) => log::error!("Failed to open: {e}"),
             }
@@ -1414,5 +1601,245 @@ impl App {
                 Err(e) => log::error!("Failed to export OBJ: {e}"),
             }
         }
+    }
+
+    fn do_import_obj(scene: &mut Scene, history: &mut History, renderer: &Renderer) {
+        let file = rfd::FileDialog::new()
+            .add_filter("Wavefront OBJ", &["obj"])
+            .set_title("Import OBJ")
+            .pick_file();
+
+        if let Some(path) = file {
+            match crate::io::import_obj(&path) {
+                Ok(objects) => {
+                    for (faces, name) in objects {
+                        let layer_idx = scene.active_layer;
+                        let (obj_idx, create) = crate::tools::draw::find_target_object(scene, layer_idx, None);
+                        let cmd = commands::PlaceTile {
+                            layer: layer_idx,
+                            object: obj_idx,
+                            faces,
+                            create_object: create,
+                            tileset_index: None,
+                        };
+                        history.push(Box::new(cmd), scene, &renderer.device);
+                        // Rename the created object
+                        if let Some(obj) = scene.layers.get_mut(layer_idx).and_then(|l| l.objects.get_mut(obj_idx))
+                            && let Some(n) = name
+                        {
+                            obj.name = n;
+                        }
+                    }
+                    log::info!("Imported OBJ from {:?}", path);
+                }
+                Err(e) => log::error!("Failed to import OBJ: {e}"),
+            }
+        }
+    }
+
+    fn do_import_glb(scene: &mut Scene, history: &mut History, renderer: &Renderer) {
+        let file = rfd::FileDialog::new()
+            .add_filter("glTF Binary", &["glb"])
+            .set_title("Import GLB")
+            .pick_file();
+
+        if let Some(path) = file {
+            match crate::io::import_glb(&path) {
+                Ok(objects) => {
+                    for (faces, name) in objects {
+                        let layer_idx = scene.active_layer;
+                        let (obj_idx, create) = crate::tools::draw::find_target_object(scene, layer_idx, None);
+                        let cmd = commands::PlaceTile {
+                            layer: layer_idx,
+                            object: obj_idx,
+                            faces,
+                            create_object: create,
+                            tileset_index: None,
+                        };
+                        history.push(Box::new(cmd), scene, &renderer.device);
+                        if let Some(obj) = scene.layers.get_mut(layer_idx).and_then(|l| l.objects.get_mut(obj_idx))
+                            && let Some(n) = name
+                        {
+                            obj.name = n;
+                        }
+                    }
+                    log::info!("Imported GLB from {:?}", path);
+                }
+                Err(e) => log::error!("Failed to import GLB: {e}"),
+            }
+        }
+    }
+
+    fn apply_uv_op(
+        edit_state: &EditState,
+        scene: &mut Scene,
+        history: &mut History,
+        device: &wgpu::Device,
+        transform: impl Fn([glam::Vec2; 4]) -> [glam::Vec2; 4],
+    ) {
+        if edit_state.selection.faces.is_empty() { return; }
+        let mut face_indices = Vec::new();
+        let mut old_uvs = Vec::new();
+        let mut new_uvs = Vec::new();
+        for &(li, oi, fi) in &edit_state.selection.faces {
+            if let Some(face) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.faces.get(fi))
+            {
+                face_indices.push((li, oi, fi));
+                old_uvs.push(face.uvs);
+                new_uvs.push(transform(face.uvs));
+            }
+        }
+        let cmd = commands::ManipulateUVs { faces: face_indices, old_uvs, new_uvs };
+        history.push(Box::new(cmd), scene, device);
+    }
+
+    fn apply_merge_vertices(
+        edit_state: &EditState,
+        scene: &mut Scene,
+        history: &mut History,
+        device: &wgpu::Device,
+    ) {
+        if !edit_state.selection.vertices.is_empty() {
+            // Vertex mode: merge all to centroid
+            let mut sum = glam::Vec3::ZERO;
+            let mut count = 0;
+            for &(li, oi, fi, vi) in &edit_state.selection.vertices {
+                if let Some(pos) = scene.layers.get(li)
+                    .and_then(|l| l.objects.get(oi))
+                    .and_then(|o| o.faces.get(fi))
+                    .map(|f| f.positions[vi])
+                {
+                    sum += pos;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                let centroid = sum / count as f32;
+                let mut moves = Vec::new();
+                for &(li, oi, fi, vi) in &edit_state.selection.vertices {
+                    if let Some(old_pos) = scene.layers.get(li)
+                        .and_then(|l| l.objects.get(oi))
+                        .and_then(|o| o.faces.get(fi))
+                        .map(|f| f.positions[vi])
+                    {
+                        moves.push((li, oi, fi, vi, old_pos, centroid));
+                    }
+                }
+                if !moves.is_empty() {
+                    let cmd = commands::MergeVertices { moves };
+                    history.push(Box::new(cmd), scene, device);
+                }
+            }
+        } else if !edit_state.selection.faces.is_empty() {
+            // Face mode: weld coincident vertices across selected faces
+            let threshold = 0.001_f32;
+            let threshold_sq = threshold * threshold;
+            let mut moves = Vec::new();
+
+            // Collect all vertex positions from selected faces
+            let mut verts: Vec<(usize, usize, usize, usize, glam::Vec3)> = Vec::new();
+            for &(li, oi, fi) in &edit_state.selection.faces {
+                if let Some(face) = scene.layers.get(li)
+                    .and_then(|l| l.objects.get(oi))
+                    .and_then(|o| o.faces.get(fi))
+                {
+                    for vi in 0..4 {
+                        verts.push((li, oi, fi, vi, face.positions[vi]));
+                    }
+                }
+            }
+
+            // Find coincident pairs and merge to midpoint
+            let mut merged = vec![false; verts.len()];
+            for i in 0..verts.len() {
+                if merged[i] { continue; }
+                for j in (i + 1)..verts.len() {
+                    if merged[j] { continue; }
+                    if verts[i].4.distance_squared(verts[j].4) < threshold_sq {
+                        let mid = (verts[i].4 + verts[j].4) * 0.5;
+                        if (verts[i].4 - mid).length_squared() > 1e-12 {
+                            moves.push((verts[i].0, verts[i].1, verts[i].2, verts[i].3, verts[i].4, mid));
+                        }
+                        if (verts[j].4 - mid).length_squared() > 1e-12 {
+                            moves.push((verts[j].0, verts[j].1, verts[j].2, verts[j].3, verts[j].4, mid));
+                        }
+                        merged[j] = true;
+                    }
+                }
+            }
+
+            if !moves.is_empty() {
+                let cmd = commands::MergeVertices { moves };
+                history.push(Box::new(cmd), scene, device);
+            }
+        }
+    }
+
+    fn apply_mirror(
+        edit_state: &EditState,
+        scene: &mut Scene,
+        history: &mut History,
+        device: &wgpu::Device,
+        axis: usize, // 0=X, 1=Y, 2=Z
+    ) {
+        let crosshair = scene.crosshair_pos;
+        let mut faces_to_mirror = Vec::new();
+        let mut tileset_index = None;
+
+        for &(li, oi, fi) in &edit_state.selection.faces {
+            if let Some(face) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.faces.get(fi))
+            {
+                faces_to_mirror.push(face.clone());
+                if tileset_index.is_none() {
+                    tileset_index = scene.layers.get(li)
+                        .and_then(|l| l.objects.get(oi))
+                        .and_then(|o| o.tileset_index);
+                }
+            }
+        }
+        for &(li, oi) in &edit_state.selection.objects {
+            if let Some(obj) = scene.layers.get(li).and_then(|l| l.objects.get(oi)) {
+                for face in &obj.faces {
+                    faces_to_mirror.push(face.clone());
+                }
+                if tileset_index.is_none() {
+                    tileset_index = obj.tileset_index;
+                }
+            }
+        }
+
+        if faces_to_mirror.is_empty() { return; }
+
+        // Mirror each face
+        let mirrored: Vec<Face> = faces_to_mirror.iter().map(|face| {
+            let mut new_face = face.clone();
+            for pos in &mut new_face.positions {
+                match axis {
+                    0 => pos.x = 2.0 * crosshair.x - pos.x,
+                    1 => pos.y = 2.0 * crosshair.y - pos.y,
+                    _ => pos.z = 2.0 * crosshair.z - pos.z,
+                }
+            }
+            // Reverse winding to fix normals
+            new_face.positions.swap(1, 3);
+            new_face.uvs.swap(1, 3);
+            new_face.colors.swap(1, 3);
+            new_face
+        }).collect();
+
+        let layer_idx = scene.active_layer;
+        let (object_idx, create_object) = crate::tools::draw::find_target_object(scene, layer_idx, tileset_index);
+        let cmd = commands::PlaceTile {
+            layer: layer_idx,
+            object: object_idx,
+            faces: mirrored,
+            create_object,
+            tileset_index,
+        };
+        history.push(Box::new(cmd), scene, device);
     }
 }

@@ -87,6 +87,14 @@ fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
         DrawTool::VertexColor => {
             ui.heading("Paint Color");
             ui.color_edit_button_rgba_unmultiplied(&mut draw_state.paint_color);
+            ui.horizontal(|ui| {
+                ui.label("Radius:");
+                ui.add(egui::DragValue::new(&mut draw_state.paint_radius).range(0.0..=10.0).speed(0.1));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Opacity:");
+                ui.add(egui::DragValue::new(&mut draw_state.paint_opacity).range(0.0..=1.0).speed(0.05));
+            });
             ui.small("Click face: paint all vertices");
             ui.small("Shift+click: paint closest vertex");
         }
@@ -116,9 +124,10 @@ fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {
 
     ui.separator();
     let sel = &edit_state.selection;
-    let count = sel.faces.len() + sel.objects.len() + sel.vertices.len();
+    let count = sel.faces.len() + sel.objects.len() + sel.vertices.len() + sel.edges.len();
     let has_selection = count > 0;
     let has_faces = !sel.faces.is_empty();
+    let has_edges = !sel.edges.is_empty();
     ui.label(format!("Selected: {count}"));
 
     ui.separator();
@@ -151,6 +160,56 @@ fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {
         action = UiAction::DeleteSelection;
     }
 
+    // UV operations
+    ui.separator();
+    ui.heading("UV");
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_faces, egui::Button::new("Rot CW")).clicked() {
+            action = UiAction::UVRotateCW;
+        }
+        if ui.add_enabled(has_faces, egui::Button::new("Rot CCW")).clicked() {
+            action = UiAction::UVRotateCCW;
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_faces, egui::Button::new("Flip H")).clicked() {
+            action = UiAction::UVFlipH;
+        }
+        if ui.add_enabled(has_faces, egui::Button::new("Flip V")).clicked() {
+            action = UiAction::UVFlipV;
+        }
+    });
+
+    // Geometry operations
+    ui.separator();
+    ui.heading("Geometry");
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_selection, egui::Button::new("Merge")).clicked() {
+            action = UiAction::MergeVertices;
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_selection, egui::Button::new("Mirror X")).clicked() {
+            action = UiAction::MirrorX;
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Mirror Y")).clicked() {
+            action = UiAction::MirrorY;
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Mirror Z")).clicked() {
+            action = UiAction::MirrorZ;
+        }
+    });
+
+    // Edge operations
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_edges, egui::Button::new("Split Edge")).clicked() {
+            action = UiAction::SplitEdge;
+        }
+        if ui.add_enabled(has_edges, egui::Button::new("Collapse")).clicked() {
+            action = UiAction::CollapseEdge;
+        }
+    });
+
     ui.separator();
     ui.heading("Select");
     ui.horizontal(|ui| {
@@ -163,7 +222,9 @@ fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {
     ui.small("Click: select, Shift+click: add");
     ui.small("Drag: marquee select");
     ui.small("Arrows: move | R: rotate | F: flip");
+    ui.small("Shift+Arrow: fine | Ctrl+Arrow: coarse");
     ui.small("+/-: scale | E: extrude | T: retile");
+    ui.small("M: merge | H: hide | Shift+H: show");
     ui.small("Ctrl+C/V: copy/paste | Z: wireframe");
 
     action

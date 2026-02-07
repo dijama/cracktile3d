@@ -48,6 +48,10 @@ pub struct DrawState {
     pub paint_color: [f32; 4],
     /// Zoom level for the tileset panel display.
     pub tileset_zoom: f32,
+    /// Brush radius for vertex color painting (0 = single face).
+    pub paint_radius: f32,
+    /// Opacity for vertex color painting.
+    pub paint_opacity: f32,
 }
 
 impl DrawState {
@@ -59,6 +63,8 @@ impl DrawState {
             selected_primitive: PrimitiveShape::Box,
             paint_color: [1.0, 0.0, 0.0, 1.0],
             tileset_zoom: 1.0,
+            paint_radius: 0.0,
+            paint_opacity: 1.0,
         }
     }
 

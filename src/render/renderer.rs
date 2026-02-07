@@ -488,6 +488,20 @@ impl Renderer {
             }
         }
 
+        // Edge-level selection: draw highlighted edges
+        let edge_color = [1.0, 0.6, 0.2, 1.0]; // Orange
+        for &(li, oi, fi, ei) in &selection.edges {
+            if let Some(face) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.faces.get(fi))
+            {
+                let a = face.positions[ei];
+                let b = face.positions[(ei + 1) % 4];
+                line_verts.push(LineVertex { position: a.into(), color: edge_color });
+                line_verts.push(LineVertex { position: b.into(), color: edge_color });
+            }
+        }
+
         // Vertex-level selection: draw small crosshairs
         for &(li, oi, fi, vi) in &selection.vertices {
             if let Some(pos) = scene.layers.get(li)
@@ -589,6 +603,12 @@ impl Renderer {
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..line_verts.len() as u32, 0..1);
+    }
+
+    /// Toggle lighting preview. Currently a no-op placeholder for future shader support.
+    pub fn set_lighting_enabled(&mut self, _enabled: bool) {
+        // TODO: When lighting shader is implemented, update the camera uniform buffer
+        // to include light direction and lighting-enabled flag.
     }
 
     fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

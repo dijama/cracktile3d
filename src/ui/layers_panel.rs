@@ -1,5 +1,6 @@
 use crate::scene::Scene;
 use crate::tools::edit::EditState;
+use super::properties_panel::{PropertyEditSnapshot, PropertyEditCommit};
 
 /// UI action returned from the layers panel for the caller to execute.
 pub enum LayerAction {
@@ -14,8 +15,10 @@ pub fn draw_layers_panel(
     ctx: &egui::Context,
     scene: &mut Scene,
     edit_state: &mut EditState,
-) -> LayerAction {
+    property_snapshot: &mut Option<PropertyEditSnapshot>,
+) -> (LayerAction, Option<PropertyEditCommit>) {
     let mut action = LayerAction::None;
+    let mut prop_commit = None;
 
     egui::SidePanel::right("layers_panel").default_width(200.0).show(ctx, |ui| {
         ui.heading("Layers");
@@ -102,8 +105,8 @@ pub fn draw_layers_panel(
         // Properties sub-section
         ui.separator();
         ui.heading("Properties");
-        super::properties_panel::draw_properties_panel(ui, scene, edit_state);
+        prop_commit = super::properties_panel::draw_properties_panel(ui, scene, edit_state, property_snapshot);
     });
 
-    action
+    (action, prop_commit)
 }

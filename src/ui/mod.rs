@@ -1,5 +1,5 @@
 mod tools_panel;
-mod properties_panel;
+pub mod properties_panel;
 mod layers_panel;
 pub mod tileset_panel;
 
@@ -8,6 +8,7 @@ use crate::tools::ToolMode;
 use crate::tools::draw::DrawState;
 use crate::tools::edit::EditState;
 use crate::history::History;
+use properties_panel::PropertyEditSnapshot;
 
 /// Actions the UI wants the app to execute (can't borrow mutably inside egui closures).
 pub enum UiAction {
@@ -36,6 +37,35 @@ pub enum UiAction {
     SelectAll,
     DeselectAll,
     InvertSelection,
+    // UV operations
+    UVRotateCW,
+    UVRotateCCW,
+    UVFlipH,
+    UVFlipV,
+    // Geometry operations
+    MergeVertices,
+    MirrorX,
+    MirrorY,
+    MirrorZ,
+    // Edge operations
+    SplitEdge,
+    CollapseEdge,
+    // Import
+    ImportObj,
+    ImportGlb,
+    // Camera bookmarks
+    SaveBookmark(usize),
+    RecallBookmark(usize),
+    // Lighting
+    ToggleLighting,
+    // Recent files
+    OpenRecentFile(usize),
+}
+
+/// Result from draw_ui, including optional property edit commit.
+pub struct UiResult {
+    pub action: UiAction,
+    pub property_commit: Option<properties_panel::PropertyEditCommit>,
 }
 
 /// Draw all egui UI panels. Called each frame within egui context.
@@ -50,7 +80,10 @@ pub fn draw_ui(
     wireframe: bool,
     bg_color: &mut [f32; 3],
     has_unsaved_changes: bool,
-) -> UiAction {
+    property_snapshot: &mut Option<PropertyEditSnapshot>,
+    recent_files: &[std::path::PathBuf],
+    lighting_enabled: bool,
+) -> UiResult {
     let mut action = UiAction::None;
 
     // Menu bar
@@ -78,6 +111,21 @@ pub fn draw_ui(
                     ui.close();
                 }
                 ui.separator();
+                // Recent files
+                if !recent_files.is_empty() {
+                    ui.menu_button("Recent Files", |ui| {
+                        for (i, path) in recent_files.iter().enumerate() {
+                            let name = path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.to_string_lossy().to_string());
+                            if ui.button(&name).on_hover_text(path.to_string_lossy().to_string()).clicked() {
+                                action = UiAction::OpenRecentFile(i);
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
                 if ui.button("Load Tileset...").clicked() {
                     action = UiAction::LoadTileset;
                     ui.close();
@@ -90,6 +138,16 @@ pub fn draw_ui(
                     }
                     if ui.button("glTF Binary (.glb)").clicked() {
                         action = UiAction::ExportGlb;
+                        ui.close();
+                    }
+                });
+                ui.menu_button("Import", |ui| {
+                    if ui.button("Wavefront OBJ (.obj)").clicked() {
+                        action = UiAction::ImportObj;
+                        ui.close();
+                    }
+                    if ui.button("glTF Binary (.glb)").clicked() {
+                        action = UiAction::ImportGlb;
                         ui.close();
                     }
                 });
@@ -120,6 +178,27 @@ pub fn draw_ui(
                     action = UiAction::ToggleWireframe;
                     ui.close();
                 }
+                let light_label = if lighting_enabled { "Lighting [ON]" } else { "Lighting" };
+                if ui.button(light_label).clicked() {
+                    action = UiAction::ToggleLighting;
+                    ui.close();
+                }
+                ui.separator();
+                ui.menu_button("Bookmarks", |ui| {
+                    for i in 0..5 {
+                        if ui.button(format!("Save Bookmark {}  Ctrl+Shift+{}", i + 1, i + 1)).clicked() {
+                            action = UiAction::SaveBookmark(i);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    for i in 0..5 {
+                        if ui.button(format!("Recall Bookmark {}  Ctrl+{}", i + 1, i + 1)).clicked() {
+                            action = UiAction::RecallBookmark(i);
+                            ui.close();
+                        }
+                    }
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Background:");
@@ -136,7 +215,7 @@ pub fn draw_ui(
     }
 
     // Layers + Properties panel (right)
-    let layer_action = layers_panel::draw_layers_panel(ctx, scene, edit_state);
+    let (layer_action, prop_commit) = layers_panel::draw_layers_panel(ctx, scene, edit_state, property_snapshot);
     match layer_action {
         layers_panel::LayerAction::AddLayer => {
             let n = scene.layers.len() + 1;
@@ -209,7 +288,7 @@ pub fn draw_ui(
             ui.label(format!("Faces: {total_faces}"));
             ui.separator();
             let sel = &edit_state.selection;
-            let sel_count = sel.faces.len() + sel.objects.len() + sel.vertices.len();
+            let sel_count = sel.faces.len() + sel.objects.len() + sel.vertices.len() + sel.edges.len();
             if sel_count > 0 {
                 ui.label(format!("Selected: {sel_count}"));
                 ui.separator();
@@ -218,8 +297,15 @@ pub fn draw_ui(
                 ui.label("Wireframe");
                 ui.separator();
             }
+            if lighting_enabled {
+                ui.label("Lit");
+                ui.separator();
+            }
         });
     });
 
-    action
+    UiResult {
+        action,
+        property_commit: prop_commit,
+    }
 }

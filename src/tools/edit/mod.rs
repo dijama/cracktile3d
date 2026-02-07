@@ -28,6 +28,8 @@ pub struct Selection {
     pub faces: Vec<(usize, usize, usize)>,
     /// (layer_index, object_index, face_index, vertex_index_within_face) quads
     pub vertices: Vec<(usize, usize, usize, usize)>,
+    /// (layer_index, object_index, face_index, edge_index) for edge selection
+    pub edges: Vec<(usize, usize, usize, usize)>,
 }
 
 impl Selection {
@@ -35,10 +37,11 @@ impl Selection {
         self.objects.clear();
         self.faces.clear();
         self.vertices.clear();
+        self.edges.clear();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.objects.is_empty() && self.faces.is_empty() && self.vertices.is_empty()
+        self.objects.is_empty() && self.faces.is_empty() && self.vertices.is_empty() && self.edges.is_empty()
     }
 
     /// Compute the centroid of all selected geometry.
@@ -144,7 +147,7 @@ impl EditState {
                             }
                         }
                     }
-                    SelectionLevel::Face | SelectionLevel::Edge => {
+                    SelectionLevel::Face => {
                         for (fi, face) in object.faces.iter().enumerate() {
                             let any_inside = face.positions.iter().any(|&pos| {
                                 project_to_screen(pos, view_proj, screen_size)
@@ -154,6 +157,24 @@ impl EditState {
                                 let entry = (li, oi, fi);
                                 if !self.selection.faces.contains(&entry) {
                                     self.selection.faces.push(entry);
+                                }
+                            }
+                        }
+                    }
+                    SelectionLevel::Edge => {
+                        for (fi, face) in object.faces.iter().enumerate() {
+                            for ei in 0..4 {
+                                let a = face.positions[ei];
+                                let b = face.positions[(ei + 1) % 4];
+                                let a_inside = project_to_screen(a, view_proj, screen_size)
+                                    .is_some_and(|sp| sp.x >= min_x && sp.x <= max_x && sp.y >= min_y && sp.y <= max_y);
+                                let b_inside = project_to_screen(b, view_proj, screen_size)
+                                    .is_some_and(|sp| sp.x >= min_x && sp.x <= max_x && sp.y >= min_y && sp.y <= max_y);
+                                if a_inside && b_inside {
+                                    let entry = (li, oi, fi, ei);
+                                    if !self.selection.edges.contains(&entry) {
+                                        self.selection.edges.push(entry);
+                                    }
                                 }
                             }
                         }
@@ -187,9 +208,16 @@ impl EditState {
                     SelectionLevel::Object => {
                         self.selection.objects.push((li, oi));
                     }
-                    SelectionLevel::Face | SelectionLevel::Edge => {
+                    SelectionLevel::Face => {
                         for fi in 0..object.faces.len() {
                             self.selection.faces.push((li, oi, fi));
+                        }
+                    }
+                    SelectionLevel::Edge => {
+                        for fi in 0..object.faces.len() {
+                            for ei in 0..4 {
+                                self.selection.edges.push((li, oi, fi, ei));
+                            }
                         }
                     }
                     SelectionLevel::Vertex => {
@@ -218,7 +246,7 @@ impl EditState {
                 let old = std::mem::take(&mut self.selection.objects);
                 self.selection.objects = all.into_iter().filter(|e| !old.contains(e)).collect();
             }
-            SelectionLevel::Face | SelectionLevel::Edge => {
+            SelectionLevel::Face => {
                 let mut all = Vec::new();
                 for (li, layer) in scene.layers.iter().enumerate() {
                     if !layer.visible { continue; }
@@ -230,6 +258,21 @@ impl EditState {
                 }
                 let old = std::mem::take(&mut self.selection.faces);
                 self.selection.faces = all.into_iter().filter(|e| !old.contains(e)).collect();
+            }
+            SelectionLevel::Edge => {
+                let mut all = Vec::new();
+                for (li, layer) in scene.layers.iter().enumerate() {
+                    if !layer.visible { continue; }
+                    for (oi, object) in layer.objects.iter().enumerate() {
+                        for fi in 0..object.faces.len() {
+                            for ei in 0..4 {
+                                all.push((li, oi, fi, ei));
+                            }
+                        }
+                    }
+                }
+                let old = std::mem::take(&mut self.selection.edges);
+                self.selection.edges = all.into_iter().filter(|e| !old.contains(e)).collect();
             }
             SelectionLevel::Vertex => {
                 let mut all = Vec::new();
@@ -321,10 +364,20 @@ impl EditState {
                     }
                 }
                 SelectionLevel::Edge => {
-                    // For now, treat edge selection as face selection
-                    let entry = (hit.layer_index, hit.object_index, hit.face_index);
-                    if !self.selection.faces.contains(&entry) {
-                        self.selection.faces.push(entry);
+                    // Select the closest edge of the hit face
+                    let face = &scene.layers[hit.layer_index].objects[hit.object_index].faces[hit.face_index];
+                    let closest_edge = (0..4usize)
+                        .min_by(|&i, &j| {
+                            let mid_i = (face.positions[i] + face.positions[(i + 1) % 4]) * 0.5;
+                            let mid_j = (face.positions[j] + face.positions[(j + 1) % 4]) * 0.5;
+                            let di = mid_i.distance_squared(hit.position);
+                            let dj = mid_j.distance_squared(hit.position);
+                            di.partial_cmp(&dj).unwrap()
+                        })
+                        .unwrap_or(0);
+                    let entry = (hit.layer_index, hit.object_index, hit.face_index, closest_edge);
+                    if !self.selection.edges.contains(&entry) {
+                        self.selection.edges.push(entry);
                     }
                 }
             }

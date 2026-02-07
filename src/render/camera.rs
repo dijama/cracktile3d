@@ -6,6 +6,18 @@ pub enum Projection {
     Orthographic,
 }
 
+/// Snapshot of camera state for bookmarks.
+#[derive(Debug, Clone)]
+pub struct CameraBookmark {
+    pub position: Vec3,
+    pub target: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub projection: Projection,
+    pub ortho_scale: f32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraMode {
     Orbit,
@@ -209,6 +221,30 @@ impl Camera {
         // In orbit mode, position = target + offset. In freelook, target = position - offset direction
         // We want target in front of position: target = position - direction_from_target_to_position
         self.target = self.position - Vec3::new(dir_x, dir_y, dir_z) * self.distance;
+    }
+
+    /// Save current camera state as a bookmark.
+    pub fn to_bookmark(&self) -> CameraBookmark {
+        CameraBookmark {
+            position: self.position,
+            target: self.target,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            distance: self.distance,
+            projection: self.projection,
+            ortho_scale: self.ortho_scale,
+        }
+    }
+
+    /// Restore camera state from a bookmark.
+    pub fn apply_bookmark(&mut self, bm: &CameraBookmark) {
+        self.position = bm.position;
+        self.target = bm.target;
+        self.yaw = bm.yaw;
+        self.pitch = bm.pitch;
+        self.distance = bm.distance;
+        self.projection = bm.projection;
+        self.ortho_scale = bm.ortho_scale;
     }
 
     fn update_position(&mut self) {

@@ -1,13 +1,58 @@
+use glam::{Vec2, Vec3, Vec4};
 use crate::scene::Scene;
+
 use crate::tools::edit::EditState;
 
+/// Snapshot of a face's state before editing, for deferred undo commit.
+pub struct PropertyEditSnapshot {
+    pub face: (usize, usize, usize),
+    pub positions: [Vec3; 4],
+    pub uvs: [Vec2; 4],
+    pub colors: [Vec4; 4],
+}
+
+/// Returned when a property edit should be committed as an undo command.
+pub struct PropertyEditCommit {
+    pub face: (usize, usize, usize),
+    pub old_positions: [Vec3; 4],
+    pub old_uvs: [Vec2; 4],
+    pub old_colors: [Vec4; 4],
+    pub new_positions: [Vec3; 4],
+    pub new_uvs: [Vec2; 4],
+    pub new_colors: [Vec4; 4],
+}
+
 /// Draw the properties panel (right side, below layers).
-/// Editable properties push dirty objects to `scene.dirty_objects` for GPU rebuild.
-pub fn draw_properties_panel(ui: &mut egui::Ui, scene: &mut Scene, edit_state: &EditState) {
+/// Returns a PropertyEditCommit when a deferred edit should be finalized.
+pub fn draw_properties_panel(
+    ui: &mut egui::Ui,
+    scene: &mut Scene,
+    edit_state: &EditState,
+    snapshot: &mut Option<PropertyEditSnapshot>,
+) -> Option<PropertyEditCommit> {
     let sel = &edit_state.selection;
+    let mut commit = None;
+
     if sel.is_empty() {
+        // If there's a pending snapshot and selection was cleared, commit it
+        if let Some(snap) = snapshot.take()
+            && let Some(face) = scene.layers.get(snap.face.0)
+                .and_then(|l| l.objects.get(snap.face.1))
+                .and_then(|o| o.faces.get(snap.face.2))
+            && (snap.positions != face.positions || snap.uvs != face.uvs || snap.colors != face.colors)
+        {
+            commit = Some(PropertyEditCommit {
+                face: snap.face,
+                old_positions: snap.positions,
+                old_uvs: snap.uvs,
+                old_colors: snap.colors,
+                new_positions: face.positions,
+                new_uvs: face.uvs,
+                new_colors: face.colors,
+            });
+        }
         ui.label("No selection");
-        return;
+        return commit;
     }
 
     // Show face properties
@@ -16,6 +61,30 @@ pub fn draw_properties_panel(ui: &mut egui::Ui, scene: &mut Scene, edit_state: &
 
         if sel.faces.len() == 1 {
             let (li, oi, fi) = sel.faces[0];
+            let current_face = (li, oi, fi);
+
+            // Check if the edited face changed — if so, commit the old snapshot
+            if let &mut Some(ref snap) = snapshot
+                && snap.face != current_face
+            {
+                let old_snap = snapshot.take().unwrap();
+                if let Some(face) = scene.layers.get(old_snap.face.0)
+                    .and_then(|l| l.objects.get(old_snap.face.1))
+                    .and_then(|o| o.faces.get(old_snap.face.2))
+                    && (old_snap.positions != face.positions || old_snap.uvs != face.uvs || old_snap.colors != face.colors)
+                {
+                    commit = Some(PropertyEditCommit {
+                        face: old_snap.face,
+                        old_positions: old_snap.positions,
+                        old_uvs: old_snap.uvs,
+                        old_colors: old_snap.colors,
+                        new_positions: face.positions,
+                        new_uvs: face.uvs,
+                        new_colors: face.colors,
+                    });
+                }
+            }
+
             if let Some(face) = scene.layers.get_mut(li)
                 .and_then(|l| l.objects.get_mut(oi))
                 .and_then(|o| o.faces.get_mut(fi))
@@ -32,6 +101,9 @@ pub fn draw_properties_panel(ui: &mut egui::Ui, scene: &mut Scene, edit_state: &
                         });
                     }
                     if changed {
+                        if snapshot.is_none() {
+                            // Already mutated, but we need the OLD value. We'll take it from commit below.
+                        }
                         scene.dirty_objects.push((li, oi));
                     }
                 });
@@ -73,6 +145,16 @@ pub fn draw_properties_panel(ui: &mut egui::Ui, scene: &mut Scene, edit_state: &
                         scene.dirty_objects.push((li, oi));
                     }
                 });
+
+                // Take snapshot if we don't have one yet for this face
+                if snapshot.is_none() {
+                    *snapshot = Some(PropertyEditSnapshot {
+                        face: current_face,
+                        positions: face.positions,
+                        uvs: face.uvs,
+                        colors: face.colors,
+                    });
+                }
             }
         }
     }
@@ -109,4 +191,6 @@ pub fn draw_properties_panel(ui: &mut egui::Ui, scene: &mut Scene, edit_state: &
             }
         }
     }
+
+    commit
 }
