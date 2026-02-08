@@ -122,9 +122,27 @@ pub fn project_to_screen(pos: Vec3, view_proj: Mat4, screen_size: Vec2) -> Optio
 }
 
 /// Pick the closest face in the scene hit by a screen-space ray.
+/// When `cull_backfaces` is true, faces whose normals point away from the camera are skipped.
 pub fn pick_face(
     ray: &Ray,
     scene: &crate::scene::Scene,
+) -> Option<HitResult> {
+    pick_face_ex(ray, scene, false)
+}
+
+/// Pick the closest front-facing face (back-face culled).
+/// Use this for Draw mode placement to avoid picking invisible faces.
+pub fn pick_face_culled(
+    ray: &Ray,
+    scene: &crate::scene::Scene,
+) -> Option<HitResult> {
+    pick_face_ex(ray, scene, true)
+}
+
+fn pick_face_ex(
+    ray: &Ray,
+    scene: &crate::scene::Scene,
+    cull_backfaces: bool,
 ) -> Option<HitResult> {
     let mut closest: Option<HitResult> = None;
 
@@ -135,13 +153,18 @@ pub fn pick_face(
         for (oi, object) in layer.objects.iter().enumerate() {
             for (fi, face) in object.faces.iter().enumerate() {
                 if face.hidden { continue; }
+                let normal = face.normal();
+                // Skip back-facing faces (normal points away from camera)
+                if cull_backfaces && normal.dot(ray.direction) > 0.0 {
+                    continue;
+                }
                 if let Some(t) = ray.intersect_quad(&face.positions) {
                     let dominated = closest.as_ref().is_some_and(|c| c.distance <= t);
                     if !dominated {
                         closest = Some(HitResult {
                             distance: t,
                             position: ray.point_at(t),
-                            normal: face.normal(),
+                            normal,
                             layer_index: li,
                             object_index: oi,
                             face_index: fi,

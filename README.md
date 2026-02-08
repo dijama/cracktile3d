@@ -11,15 +11,18 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 - **Sticky** — Extend tiles from the closest edge of an existing face
 - **Block** — Place a 6-face cube in one click
 - **Primitive** — Place box, cylinder, cone, sphere, or wedge shapes
-- **Vertex Color** — Paint per-vertex colors on faces
+- **Vertex Color** — Paint per-vertex colors with configurable brush radius and opacity
 
 ### Edit Mode
 - **Selection levels** — Object, face, vertex, edge
-- **Transform** — Translate (arrow keys), rotate (R), scale (+/-)
-- **Operations** — Flip normals, extrude, retile, subdivide, delete
+- **Transform** — Translate (arrow keys), rotate (R), scale (+/-), with grid snapping (Shift=fine, Ctrl=coarse)
+- **Operations** — Flip normals, extrude, retile, subdivide, delete, merge vertices
+- **UV manipulation** — Rotate CW/CCW, flip horizontal/vertical
+- **Geometry** — Mirror X/Y/Z across crosshair plane
+- **Edge operations** — Split edge (quad → 2 quads), collapse edge (merge to midpoint)
 - **Selection tools** — Click, shift-click, marquee drag, select all, invert, select connected
 - **Copy/paste** — Ctrl+C/V with crosshair-relative placement
-- **Hide/show** — H to hide selected, Shift+H to show all
+- **Hide/show** — H to hide selected, Shift+H to show all (undoable)
 
 ### Tileset Management
 - Load PNG tilesets with configurable tile size
@@ -32,22 +35,28 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 - Scroll to zoom, numpad presets (front/back/left/right/top/bottom)
 - Freelook mode (hold right-click + WASD in Edit mode)
 - Perspective/orthographic toggle (Numpad 5)
+- 5 camera bookmarks (Ctrl+Shift+1-5 to save, Ctrl+1-5 to recall)
 
 ### File I/O
 - Native binary format (.ct3d) with save/load
+- Import from Wavefront OBJ (.obj)
+- Import from glTF Binary (.glb)
 - Export to Wavefront OBJ (.obj)
 - Export to glTF Binary (.glb)
+- Recent files menu (remembers last 10 files)
 
 ### UI
 - Tile placement preview (green wireframe ghost)
 - Hover highlight in Edit mode (blue wireframe)
-- Clickable edit operation buttons
+- Edge selection highlight (orange)
+- Clickable edit operation buttons (UV, geometry, edge ops)
 - Object tree in layers panel
-- Editable vertex positions, UVs, and colors in properties panel
+- Editable vertex positions, UVs, and colors in properties panel (with undo support)
 - Elevated grid at crosshair height
 - Unsaved changes indicator
 - Background color picker
 - Wireframe toggle (Z)
+- Lighting preview toggle
 
 ## Controls
 
@@ -78,14 +87,17 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 ### Edit Mode
 | Key | Action |
 |-----|--------|
-| Arrow keys | Translate selection |
+| Arrow keys | Translate selection (grid step) |
+| Shift+Arrow keys | Translate selection (fine: half grid step) |
+| Ctrl+Arrow keys | Translate selection (coarse: double grid step) |
 | R / Shift+R | Rotate CW / CCW |
 | +/- | Scale (in Scale mode) |
 | F | Flip normals |
 | E | Extrude faces |
 | T | Retile selected faces |
+| M | Merge vertices |
 | C | Center camera on selection |
-| H / Shift+H | Hide selected / Show all |
+| H / Shift+H | Hide selected / Show all (undoable) |
 | Del / Backspace | Delete selection |
 | Ctrl+A | Select all |
 | Ctrl+D | Deselect all |
@@ -94,6 +106,8 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 | Ctrl+C / Ctrl+V | Copy / Paste |
 | Alt+D | Subdivide faces |
 | Enter | Create object from selection |
+| Ctrl+Shift+1-5 | Save camera bookmark |
+| Ctrl+1-5 | Recall camera bookmark |
 | Right-click + WASD | Freelook camera |
 
 ## Building from Source
@@ -148,7 +162,7 @@ src/
 ├── ui/                  # egui panels (tools, layers, tileset, properties)
 ├── history/             # Undo/redo command pattern
 ├── tile/                # Tileset loading + UV computation
-├── io/                  # Save/load (.ct3d), export (OBJ, GLB)
+├── io/                  # Save/load (.ct3d), import/export (OBJ, GLB)
 └── util/                # Raycasting, picking
 ```
 

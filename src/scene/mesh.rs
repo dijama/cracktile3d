@@ -76,7 +76,7 @@ impl Face {
 fn tangent_basis(normal: Vec3) -> (Vec3, Vec3) {
     let n = normal.normalize();
     let reference = if n.y.abs() > 0.9 { Vec3::Z } else { Vec3::Y };
-    let right = n.cross(reference).normalize();
-    let up = right.cross(n).normalize();
+    let right = reference.cross(n).normalize();
+    let up = n.cross(right).normalize();
     (right, up)
 }

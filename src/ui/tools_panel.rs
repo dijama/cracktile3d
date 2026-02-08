@@ -57,9 +57,46 @@ fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
         }
     }
     ui.separator();
+
+    // Placement plane indicator
+    let plane_label = placement_plane_label(draw_state.placement_normal);
+    ui.label(format!("Plane: {plane_label}"));
+
+    // Tilebrush rotation/flip state
+    ui.separator();
+    ui.heading("Tilebrush");
+    ui.horizontal(|ui| {
+        let rot_label = match draw_state.tilebrush_rotation {
+            0 => "0",
+            1 => "90",
+            2 => "180",
+            3 => "270",
+            _ => "?",
+        };
+        ui.label(format!("Rot: {rot_label}"));
+        if ui.small_button("R").on_hover_text("Rotate CW (R)").clicked() {
+            draw_state.tilebrush_rotation = (draw_state.tilebrush_rotation + 1) % 4;
+        }
+        if ui.small_button("R'").on_hover_text("Rotate CCW (Shift+R)").clicked() {
+            draw_state.tilebrush_rotation = (draw_state.tilebrush_rotation + 3) % 4;
+        }
+    });
+    ui.horizontal(|ui| {
+        let fh = if draw_state.tilebrush_flip_h { "ON" } else { "off" };
+        let fv = if draw_state.tilebrush_flip_v { "ON" } else { "off" };
+        if ui.small_button(format!("FlipH: {fh}")).on_hover_text("G").clicked() {
+            draw_state.tilebrush_flip_h = !draw_state.tilebrush_flip_h;
+        }
+        if ui.small_button(format!("FlipV: {fv}")).on_hover_text("F").clicked() {
+            draw_state.tilebrush_flip_v = !draw_state.tilebrush_flip_v;
+        }
+    });
+
+    ui.separator();
     match draw_state.tool {
         DrawTool::Tile => {
             ui.small("Click: place tile on grid/face");
+            ui.small("Drag: paint tiles continuously");
             ui.small("Right click: erase tile");
         }
         DrawTool::Sticky => {
@@ -100,7 +137,20 @@ fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
         }
     }
     ui.separator();
+    ui.small("R/Shift+R: rotate tile | F: flip V | G: flip H");
     ui.small("[ / ]: change grid size");
+}
+
+fn placement_plane_label(normal: glam::Vec3) -> &'static str {
+    if normal.y.abs() > 0.9 {
+        if normal.y > 0.0 { "XZ (Top)" } else { "XZ (Bottom)" }
+    } else if normal.x.abs() > 0.9 {
+        if normal.x > 0.0 { "YZ (Right)" } else { "YZ (Left)" }
+    } else if normal.z.abs() > 0.9 {
+        if normal.z > 0.0 { "XY (Back)" } else { "XY (Front)" }
+    } else {
+        "Custom"
+    }
 }
 
 fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {

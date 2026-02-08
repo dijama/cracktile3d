@@ -13,7 +13,7 @@ use crate::input::InputState;
 use crate::scene::mesh::Face;
 use crate::scene::{Scene, GRID_PRESETS};
 use crate::tools::ToolMode;
-use crate::tools::draw::{DrawState, DrawTool};
+use crate::tools::draw::{DrawState, DrawTool, camera_placement_normal};
 use crate::tools::edit::{EditState, GizmoMode};
 use crate::history::History;
 use crate::history::commands;
@@ -73,6 +73,8 @@ pub struct App {
     camera_bookmarks: [Option<CameraBookmark>; 5],
     /// Lighting preview enabled
     lighting_enabled: bool,
+    /// Last position where a tile was placed during drag-painting (to avoid duplicates).
+    last_placed_pos: Option<glam::Vec3>,
 }
 
 /// Everything that requires the window to exist.
@@ -108,6 +110,7 @@ impl App {
             recent_files,
             camera_bookmarks: [None, None, None, None, None],
             lighting_enabled: false,
+            last_placed_pos: None,
         }
     }
 
@@ -309,6 +312,12 @@ impl App {
             }
         }
 
+        // Update placement normal from camera direction
+        {
+            let cam_fwd = (gpu.renderer.camera.target - gpu.renderer.camera.position).normalize();
+            self.draw_state.placement_normal = camera_placement_normal(cam_fwd);
+        }
+
         // Grid preset cycling ([ / ])
         if self.input.key_just_pressed(KeyCode::BracketRight)
             && self.scene.grid_preset_index + 1 < GRID_PRESETS.len()
@@ -348,6 +357,24 @@ impl App {
             if self.input.key_just_pressed(KeyCode::Digit5) { self.draw_state.tool = DrawTool::VertexColor; }
         }
 
+        // Draw mode: tilebrush rotation/flip keys
+        if self.tool_mode == ToolMode::Draw && !self.input.space_held() {
+            let shift = self.input.key_held(KeyCode::ShiftLeft) || self.input.key_held(KeyCode::ShiftRight);
+            if self.input.key_just_pressed(KeyCode::KeyR) {
+                if shift {
+                    self.draw_state.tilebrush_rotation = (self.draw_state.tilebrush_rotation + 3) % 4;
+                } else {
+                    self.draw_state.tilebrush_rotation = (self.draw_state.tilebrush_rotation + 1) % 4;
+                }
+            }
+            if self.input.key_just_pressed(KeyCode::KeyF) {
+                self.draw_state.tilebrush_flip_v = !self.draw_state.tilebrush_flip_v;
+            }
+            if self.input.key_just_pressed(KeyCode::KeyG) {
+                self.draw_state.tilebrush_flip_h = !self.draw_state.tilebrush_flip_h;
+            }
+        }
+
         // Draw mode: left click places tile or paints vertex color (when not orbiting with Space)
         if self.tool_mode == ToolMode::Draw
             && self.input.left_just_clicked
@@ -365,7 +392,7 @@ impl App {
 
             if self.draw_state.tool == DrawTool::VertexColor {
                 // Vertex color tool: paint hit face (with radius/opacity)
-                if let Some(hit) = crate::util::picking::pick_face(&ray, &self.scene) {
+                if let Some(hit) = crate::util::picking::pick_face_culled(&ray, &self.scene) {
                     let c = self.draw_state.paint_color;
                     let new_color = glam::Vec4::new(c[0], c[1], c[2], c[3]);
                     let opacity = self.draw_state.paint_opacity;
@@ -404,6 +431,11 @@ impl App {
                     self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
                 }
             } else if let Some(result) = self.draw_state.compute_placement(&self.scene, &ray) {
+                // Track placement position for drag-painting
+                if self.draw_state.tool == DrawTool::Tile && !result.faces.is_empty() {
+                    let center = (result.faces[0].positions[0] + result.faces[0].positions[2]) * 0.5;
+                    self.last_placed_pos = Some(center);
+                }
                 let cmd = commands::PlaceTile {
                     layer: result.layer,
                     object: result.object,
@@ -413,6 +445,51 @@ impl App {
                 };
                 self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
             }
+        }
+
+        // Draw mode: drag-painting for Tile tool (continuous placement while dragging)
+        if self.tool_mode == ToolMode::Draw
+            && self.draw_state.tool == DrawTool::Tile
+            && self.input.left_pressed
+            && self.input.is_dragging
+            && !self.input.left_just_clicked
+            && !self.input.space_held()
+        {
+            let screen_size = glam::Vec2::new(
+                gpu.renderer.config.width as f32,
+                gpu.renderer.config.height as f32,
+            );
+            let ray = Ray::from_screen(
+                self.input.mouse_pos,
+                screen_size,
+                gpu.renderer.camera.view_projection(),
+            );
+            if let Some(result) = self.draw_state.compute_placement(&self.scene, &ray)
+                && !result.faces.is_empty()
+            {
+                let center = (result.faces[0].positions[0] + result.faces[0].positions[2]) * 0.5;
+                let should_place = if let Some(last) = self.last_placed_pos {
+                    center.distance_squared(last) > 0.001
+                } else {
+                    true
+                };
+                if should_place {
+                    self.last_placed_pos = Some(center);
+                    let cmd = commands::PlaceTile {
+                        layer: result.layer,
+                        object: result.object,
+                        faces: result.faces,
+                        create_object: result.create_object,
+                        tileset_index: result.tileset_index,
+                    };
+                    self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                }
+            }
+        }
+
+        // Clear drag-paint tracking when left button released
+        if !self.input.left_pressed {
+            self.last_placed_pos = None;
         }
 
         // Draw mode: right click erases tile
@@ -447,7 +524,7 @@ impl App {
                 screen_size,
                 gpu.renderer.camera.view_projection(),
             );
-            if let Some(hit) = crate::util::picking::pick_face(&ray, &self.scene) {
+            if let Some(hit) = crate::util::picking::pick_face_culled(&ray, &self.scene) {
                 let face = &self.scene.layers[hit.layer_index].objects[hit.object_index].faces[hit.face_index];
                 let obj = &self.scene.layers[hit.layer_index].objects[hit.object_index];
                 if let Some(ts_idx) = obj.tileset_index {

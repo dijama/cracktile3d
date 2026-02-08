@@ -16,7 +16,7 @@ pub fn draw_tileset_panel(
     let mut action = TilesetAction::None;
 
     egui::TopBottomPanel::bottom("tileset_panel")
-        .default_height(180.0)
+        .default_height(280.0)
         .resizable(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -52,7 +52,10 @@ pub fn draw_tileset_panel(
                     draw_state.tileset_zoom = (draw_state.tileset_zoom - 0.25).max(0.25);
                 }
                 if ui.small_button("+").clicked() {
-                    draw_state.tileset_zoom = (draw_state.tileset_zoom + 0.25).min(4.0);
+                    draw_state.tileset_zoom = (draw_state.tileset_zoom + 0.25).min(8.0);
+                }
+                if ui.small_button("Fit").clicked() {
+                    draw_state.tileset_zoom = 1.0;
                 }
             });
 
@@ -65,11 +68,24 @@ pub fn draw_tileset_panel(
                         let cols = tileset.cols();
                         let rows = tileset.rows();
 
-                        // Calculate display size with zoom
+                        if cols == 0 || rows == 0 {
+                            ui.label("Tileset has no tiles (check tile size).");
+                            return;
+                        }
+
+                        // Scale tileset to fit available width, then apply zoom multiplier.
+                        // This ensures tiles are large enough to see and click regardless
+                        // of the native tileset pixel size.
+                        let available_width = ui.available_width().max(100.0);
                         let img_aspect = tileset.image_width as f32 / tileset.image_height as f32;
-                        let base_height = tileset.image_height as f32;
+
+                        // Base size: fit tileset width to panel width
+                        let base_width = available_width;
+                        let base_height = base_width / img_aspect;
+
+                        // Apply zoom
+                        let display_width = base_width * draw_state.tileset_zoom;
                         let display_height = base_height * draw_state.tileset_zoom;
-                        let display_width = display_height * img_aspect;
                         let display_size = egui::vec2(display_width, display_height);
 
                         // Wrap in scroll area for zoom
@@ -85,7 +101,7 @@ pub fn draw_tileset_panel(
                                 let scroll = ui.input(|i| i.raw_scroll_delta.y);
                                 if scroll != 0.0 {
                                     let delta = if scroll > 0.0 { 0.25 } else { -0.25 };
-                                    draw_state.tileset_zoom = (draw_state.tileset_zoom + delta).clamp(0.25, 4.0);
+                                    draw_state.tileset_zoom = (draw_state.tileset_zoom + delta).clamp(0.25, 8.0);
                                 }
                             }
 
@@ -117,7 +133,7 @@ pub fn draw_tileset_panel(
                                 );
                             }
 
-                            // Highlight selected tile region
+                            // Highlight selected tile region with filled overlay + thick border
                             let c0 = draw_state.selected_tile.0.min(draw_state.selected_tile_end.0);
                             let c1 = draw_state.selected_tile.0.max(draw_state.selected_tile_end.0);
                             let r0 = draw_state.selected_tile.1.min(draw_state.selected_tile_end.1);
@@ -133,6 +149,12 @@ pub fn draw_tileset_panel(
                                         rect.left() + (c1 + 1).min(cols) as f32 * cell_w,
                                         rect.top() + (r1 + 1).min(rows) as f32 * cell_h,
                                     ),
+                                );
+                                // Semi-transparent yellow fill so selection is visible even on tiny tiles
+                                painter.rect_filled(
+                                    sel_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 0, 60),
                                 );
                                 painter.rect_stroke(
                                     sel_rect,
