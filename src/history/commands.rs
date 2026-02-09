@@ -1103,3 +1103,319 @@ impl Command for CreateObjectFromSelection {
         "Create Object"
     }
 }
+
+/// Split selected quads into 2 triangles each.
+/// `diagonal` selects which diagonal to split along: 0 = 0→2, 1 = 1→3.
+/// Triangles are stored as degenerate quads where vertex 3 equals vertex 2 (for diagonal 0)
+/// or vertex 3 equals vertex 0 (for diagonal 1).
+pub struct TriangleDivide {
+    pub faces: Vec<(usize, usize, usize)>,
+    pub diagonal: u8,
+    original_faces: Vec<Face>,
+    added_per_object: Vec<(usize, usize, usize)>, // (li, oi, count_added)
+}
+
+impl TriangleDivide {
+    pub fn new(faces: Vec<(usize, usize, usize)>, diagonal: u8) -> Self {
+        Self { faces, diagonal, original_faces: Vec::new(), added_per_object: Vec::new() }
+    }
+}
+
+impl Command for TriangleDivide {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        self.original_faces.clear();
+        self.added_per_object.clear();
+        let mut adds_per_obj: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+
+        // Process in reverse index order so removals don't shift earlier indices
+        let mut sorted = self.faces.clone();
+        sorted.sort_by(|a, b| b.2.cmp(&a.2));
+
+        for &(li, oi, fi) in &sorted {
+            let face = scene.layers[li].objects[oi].faces[fi].clone();
+            self.original_faces.push(face.clone());
+
+            let p = face.positions;
+            let uv = face.uvs;
+            let c = face.colors;
+
+            let triangles = if self.diagonal == 0 {
+                // Split along 0→2 diagonal: triangles (0,1,2) and (0,2,3)
+                [
+                    Face { positions: [p[0], p[1], p[2], p[2]], uvs: [uv[0], uv[1], uv[2], uv[2]], colors: [c[0], c[1], c[2], c[2]], hidden: false },
+                    Face { positions: [p[0], p[2], p[3], p[3]], uvs: [uv[0], uv[2], uv[3], uv[3]], colors: [c[0], c[2], c[3], c[3]], hidden: false },
+                ]
+            } else {
+                // Split along 1→3 diagonal: triangles (0,1,3) and (1,2,3)
+                [
+                    Face { positions: [p[0], p[1], p[3], p[3]], uvs: [uv[0], uv[1], uv[3], uv[3]], colors: [c[0], c[1], c[3], c[3]], hidden: false },
+                    Face { positions: [p[1], p[2], p[3], p[3]], uvs: [uv[1], uv[2], uv[3], uv[3]], colors: [c[1], c[2], c[3], c[3]], hidden: false },
+                ]
+            };
+
+            scene.layers[li].objects[oi].faces.remove(fi);
+            for tf in triangles {
+                scene.layers[li].objects[oi].faces.push(tf);
+            }
+            *adds_per_obj.entry((li, oi)).or_insert(0) += 2;
+        }
+
+        for ((li, oi), count) in &adds_per_obj {
+            self.added_per_object.push((*li, *oi, *count));
+        }
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, _) in &self.faces { rebuild.insert((li, oi)); }
+        for (li, oi) in rebuild { scene.layers[li].objects[oi].rebuild_gpu_mesh(device); }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        // Remove added triangles
+        for &(li, oi, count) in &self.added_per_object {
+            for _ in 0..count {
+                scene.layers[li].objects[oi].faces.pop();
+            }
+        }
+
+        // Re-insert original faces
+        let mut sorted = self.faces.clone();
+        sorted.sort_by(|a, b| b.2.cmp(&a.2));
+        for (i, &(li, oi, fi)) in sorted.iter().enumerate() {
+            if let Some(orig) = self.original_faces.get(i) {
+                scene.layers[li].objects[oi].faces.insert(fi, orig.clone());
+            }
+        }
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, _) in &self.faces { rebuild.insert((li, oi)); }
+        for (li, oi) in rebuild { scene.layers[li].objects[oi].rebuild_gpu_mesh(device); }
+    }
+
+    fn description(&self) -> &str {
+        "Triangle Divide"
+    }
+}
+
+/// Merge pairs of adjacent triangular faces (degenerate quads) back into proper quads.
+/// `pairs` is a list of ((li,oi,fi_a), (li,oi,fi_b)) triangle pairs to merge.
+pub struct TriangleMerge {
+    pub pairs: Vec<((usize, usize, usize), (usize, usize, usize))>,
+    /// Stored removed faces and the merged face for undo.
+    removed: Vec<((usize, usize, usize), Face, (usize, usize, usize), Face)>,
+    added: Vec<(usize, usize)>, // (li, oi) where we pushed a merged face
+}
+
+impl TriangleMerge {
+    pub fn new(pairs: Vec<((usize, usize, usize), (usize, usize, usize))>) -> Self {
+        Self { pairs, removed: Vec::new(), added: Vec::new() }
+    }
+}
+
+impl Command for TriangleMerge {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        self.removed.clear();
+        self.added.clear();
+
+        // Collect all face indices to remove, then process pairs
+        let mut to_remove: Vec<(usize, usize, usize)> = Vec::new();
+        let mut merged_faces: Vec<(usize, usize, Face)> = Vec::new();
+
+        for &((li_a, oi_a, fi_a), (li_b, oi_b, fi_b)) in &self.pairs {
+            if li_a != li_b || oi_a != oi_b { continue; }
+            let face_a = scene.layers[li_a].objects[oi_a].faces[fi_a].clone();
+            let face_b = scene.layers[li_b].objects[oi_b].faces[fi_b].clone();
+
+            // Get unique vertices from both triangles
+            let verts_a = degenerate_tri_verts(&face_a);
+            let verts_b = degenerate_tri_verts(&face_b);
+
+            if let Some(merged) = merge_two_triangles(&verts_a, &verts_b) {
+                self.removed.push(((li_a, oi_a, fi_a), face_a, (li_b, oi_b, fi_b), face_b));
+                to_remove.push((li_a, oi_a, fi_a));
+                to_remove.push((li_b, oi_b, fi_b));
+                merged_faces.push((li_a, oi_a, merged));
+            }
+        }
+
+        // Remove faces in reverse index order
+        to_remove.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)).then_with(|| b.0.cmp(&a.0)));
+        for &(li, oi, fi) in &to_remove {
+            scene.layers[li].objects[oi].faces.remove(fi);
+        }
+
+        // Add merged faces
+        for (li, oi, face) in merged_faces {
+            scene.layers[li].objects[oi].faces.push(face);
+            self.added.push((li, oi));
+        }
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, _) in &to_remove { rebuild.insert((li, oi)); }
+        for (li, oi) in rebuild { scene.layers[li].objects[oi].rebuild_gpu_mesh(device); }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        // Remove merged faces (they were pushed to end)
+        for &(li, oi) in self.added.iter().rev() {
+            scene.layers[li].objects[oi].faces.pop();
+        }
+
+        // Re-insert original triangle faces in ascending fi order
+        let mut to_restore: Vec<(usize, usize, usize, Face)> = Vec::new();
+        for (a_key, a_face, b_key, b_face) in &self.removed {
+            to_restore.push((a_key.0, a_key.1, a_key.2, a_face.clone()));
+            to_restore.push((b_key.0, b_key.1, b_key.2, b_face.clone()));
+        }
+        to_restore.sort_by_key(|(_, _, fi, _)| *fi);
+        for (li, oi, fi, face) in to_restore {
+            scene.layers[li].objects[oi].faces.insert(fi, face);
+        }
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi) in &self.added { rebuild.insert((li, oi)); }
+        for (li, oi) in rebuild { scene.layers[li].objects[oi].rebuild_gpu_mesh(device); }
+    }
+
+    fn description(&self) -> &str {
+        "Triangle Merge"
+    }
+}
+
+/// Remove faces whose centers fall inside a given AABB.
+pub struct SubtractBlock {
+    pub aabb_min: Vec3,
+    pub aabb_max: Vec3,
+    /// Stored for undo: (li, oi, fi, face) sorted by fi descending
+    removed: Vec<(usize, usize, usize, Face)>,
+}
+
+impl SubtractBlock {
+    pub fn new(aabb_min: Vec3, aabb_max: Vec3) -> Self {
+        Self { aabb_min, aabb_max, removed: Vec::new() }
+    }
+}
+
+impl Command for SubtractBlock {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        self.removed.clear();
+        let min = self.aabb_min;
+        let max = self.aabb_max;
+
+        // Collect faces to remove
+        let mut to_remove: Vec<(usize, usize, usize, Face)> = Vec::new();
+        for (li, layer) in scene.layers.iter().enumerate() {
+            for (oi, obj) in layer.objects.iter().enumerate() {
+                for (fi, face) in obj.faces.iter().enumerate() {
+                    let center = (face.positions[0] + face.positions[1] + face.positions[2] + face.positions[3]) * 0.25;
+                    if center.x >= min.x && center.x <= max.x
+                        && center.y >= min.y && center.y <= max.y
+                        && center.z >= min.z && center.z <= max.z
+                    {
+                        to_remove.push((li, oi, fi, face.clone()));
+                    }
+                }
+            }
+        }
+
+        // Remove in reverse fi order
+        to_remove.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)).then_with(|| b.0.cmp(&a.0)));
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for &(li, oi, fi, _) in &to_remove {
+            scene.layers[li].objects[oi].faces.remove(fi);
+            rebuild.insert((li, oi));
+        }
+
+        self.removed = to_remove;
+
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        // Re-insert in ascending fi order
+        let mut to_restore = self.removed.clone();
+        to_restore.sort_by_key(|(_, _, fi, _)| *fi);
+
+        let mut rebuild: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for (li, oi, fi, face) in to_restore {
+            scene.layers[li].objects[oi].faces.insert(fi, face);
+            rebuild.insert((li, oi));
+        }
+
+        for (li, oi) in rebuild {
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Subtract Block"
+    }
+}
+
+/// Extract the 3 unique vertices from a degenerate quad (triangle).
+/// Returns [(pos, uv, color); 3] or all 4 if not degenerate.
+fn degenerate_tri_verts(face: &Face) -> Vec<(Vec3, Vec2, Vec4)> {
+    let mut verts = Vec::with_capacity(4);
+    for i in 0..4 {
+        let v = (face.positions[i], face.uvs[i], face.colors[i]);
+        if !verts.iter().any(|(p, _, _): &(Vec3, Vec2, Vec4)| p.distance(v.0) < 1e-5) {
+            verts.push(v);
+        }
+    }
+    verts
+}
+
+/// Try to merge two triangles (each with 3 unique verts) into a quad.
+/// They must share exactly 2 vertices (an edge).
+fn merge_two_triangles(
+    a: &[(Vec3, Vec2, Vec4)],
+    b: &[(Vec3, Vec2, Vec4)],
+) -> Option<Face> {
+    if a.len() != 3 || b.len() != 3 { return None; }
+
+    // Find shared edge: 2 verts from a that match 2 verts from b
+    let eps = 1e-4;
+    let mut shared_a = Vec::new();
+    let mut shared_b = Vec::new();
+    let mut unique_a = Vec::new();
+    let mut unique_b = Vec::new();
+
+    for (i, va) in a.iter().enumerate() {
+        let mut found = false;
+        for (j, vb) in b.iter().enumerate() {
+            if va.0.distance(vb.0) < eps {
+                shared_a.push(i);
+                shared_b.push(j);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            unique_a.push(i);
+        }
+    }
+    for (j, _) in b.iter().enumerate() {
+        if !shared_b.contains(&j) {
+            unique_b.push(j);
+        }
+    }
+
+    if shared_a.len() != 2 || unique_a.len() != 1 || unique_b.len() != 1 {
+        return None;
+    }
+
+    // Build quad: unique_a, shared[0], unique_b, shared[1]
+    // This forms a proper winding order around the quad
+    let va = a[unique_a[0]];
+    let s0 = a[shared_a[0]];
+    let vb = b[unique_b[0]];
+    let s1 = a[shared_a[1]];
+
+    Some(Face {
+        positions: [va.0, s0.0, vb.0, s1.0],
+        uvs: [va.1, s0.1, vb.1, s1.1],
+        colors: [va.2, s0.2, vb.2, s1.2],
+        hidden: false,
+    })
+}

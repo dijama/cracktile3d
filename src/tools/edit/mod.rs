@@ -1,4 +1,5 @@
-use glam::{Mat4, Vec2};
+use glam::{Mat4, Vec2, Vec3};
+use crate::render::gizmo::{GizmoAxis, GizmoDrag};
 use crate::scene::Scene;
 use crate::util::picking::{self, project_to_screen, Ray};
 
@@ -87,11 +88,29 @@ impl Selection {
     }
 }
 
+/// State for a direct vertex/face drag in the viewport.
+pub struct VertexDrag {
+    /// Constraint plane normal (perpendicular to camera).
+    pub plane_normal: Vec3,
+    /// Point on the constraint plane where drag started.
+    pub start_world: Vec3,
+    /// All vertices being dragged: (li, oi, fi, vi, original_position).
+    pub targets: Vec<(usize, usize, usize, usize, Vec3)>,
+    /// Accumulated delta applied so far.
+    pub applied_delta: Vec3,
+}
+
 /// Active edit-mode state.
 pub struct EditState {
     pub selection_level: SelectionLevel,
     pub gizmo_mode: GizmoMode,
     pub selection: Selection,
+    /// Which gizmo axis the mouse is hovering over (for highlight).
+    pub gizmo_hovered: GizmoAxis,
+    /// Active gizmo drag operation (None when not dragging).
+    pub gizmo_drag: Option<GizmoDrag>,
+    /// Active direct vertex/face drag (None when not dragging).
+    pub vertex_drag: Option<VertexDrag>,
 }
 
 impl EditState {
@@ -100,6 +119,9 @@ impl EditState {
             selection_level: SelectionLevel::Face,
             gizmo_mode: GizmoMode::Translate,
             selection: Selection::default(),
+            gizmo_hovered: GizmoAxis::None,
+            gizmo_drag: None,
+            vertex_drag: None,
         }
     }
 
@@ -323,6 +345,200 @@ impl EditState {
         }
 
         self.selection.faces = selected.into_iter().collect();
+    }
+
+    /// Select all faces whose normal faces toward the camera direction (within angle threshold).
+    pub fn select_by_normal(&mut self, scene: &Scene, camera_forward: Vec3, threshold_degrees: f32) {
+        let threshold_cos = threshold_degrees.to_radians().cos();
+        self.selection.clear();
+        for (li, layer) in scene.layers.iter().enumerate() {
+            if !layer.visible { continue; }
+            for (oi, object) in layer.objects.iter().enumerate() {
+                for (fi, face) in object.faces.iter().enumerate() {
+                    if face.hidden { continue; }
+                    let n = face.normal();
+                    // Face is "facing camera" if its normal points toward the camera
+                    // (dot product of normal with -camera_forward > threshold)
+                    if n.dot(-camera_forward) > threshold_cos {
+                        self.selection.faces.push((li, oi, fi));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Select all faces that overlap (same position within epsilon) with another face.
+    pub fn select_overlapping(&mut self, scene: &Scene) {
+        self.selection.clear();
+        let eps = 1e-4;
+
+        // Collect face centroids for fast overlap detection
+        let mut face_data: Vec<(usize, usize, usize, Vec3)> = Vec::new();
+        for (li, layer) in scene.layers.iter().enumerate() {
+            if !layer.visible { continue; }
+            for (oi, object) in layer.objects.iter().enumerate() {
+                for (fi, face) in object.faces.iter().enumerate() {
+                    if face.hidden { continue; }
+                    let centroid = (face.positions[0] + face.positions[1] + face.positions[2] + face.positions[3]) * 0.25;
+                    face_data.push((li, oi, fi, centroid));
+                }
+            }
+        }
+
+        let mut overlap_set = std::collections::HashSet::new();
+        for i in 0..face_data.len() {
+            for j in (i + 1)..face_data.len() {
+                if (face_data[i].3 - face_data[j].3).length_squared() < eps {
+                    overlap_set.insert((face_data[i].0, face_data[i].1, face_data[i].2));
+                    overlap_set.insert((face_data[j].0, face_data[j].1, face_data[j].2));
+                }
+            }
+        }
+
+        self.selection.faces = overlap_set.into_iter().collect();
+    }
+
+    /// Select faces that use UVs matching the given tile UVs (within epsilon).
+    pub fn select_by_uvs(&mut self, scene: &Scene, target_uvs: &[glam::Vec2; 4]) {
+        self.selection.clear();
+        let eps = 1e-4;
+        for (li, layer) in scene.layers.iter().enumerate() {
+            if !layer.visible { continue; }
+            for (oi, object) in layer.objects.iter().enumerate() {
+                for (fi, face) in object.faces.iter().enumerate() {
+                    if face.hidden { continue; }
+                    let matches = face.uvs.iter().zip(target_uvs.iter())
+                        .all(|(a, b)| (*a - *b).length_squared() <= eps);
+                    if matches {
+                        self.selection.faces.push((li, oi, fi));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Select edge loop: follow connected edges where each intermediate vertex connects exactly 2 edges.
+    pub fn select_edge_loop(&mut self, scene: &Scene) {
+        if self.selection.edges.is_empty() { return; }
+
+        // Build edge-to-face adjacency for the same object
+        let &(li, oi, fi, ei) = &self.selection.edges[0];
+        let object = match scene.layers.get(li).and_then(|l| l.objects.get(oi)) {
+            Some(o) => o,
+            None => return,
+        };
+
+        // Build a map from edge (as sorted vertex pair by position) to face+edge_index
+        let eps = 1e-5;
+        let mut positions: Vec<Vec3> = Vec::new();
+        let mut pos_to_idx = |p: Vec3| -> usize {
+            for (i, &existing) in positions.iter().enumerate() {
+                if (existing - p).length_squared() < eps {
+                    return i;
+                }
+            }
+            positions.push(p);
+            positions.len() - 1
+        };
+
+        // Map: vertex_index -> list of (face_idx, edge_idx, other_vertex_index)
+        let mut vert_edges: std::collections::HashMap<usize, Vec<(usize, usize, usize)>> = std::collections::HashMap::new();
+
+        for (face_idx, face) in object.faces.iter().enumerate() {
+            for edge_idx in 0..4 {
+                let a_idx = pos_to_idx(face.positions[edge_idx]);
+                let b_idx = pos_to_idx(face.positions[(edge_idx + 1) % 4]);
+                vert_edges.entry(a_idx).or_default().push((face_idx, edge_idx, b_idx));
+                vert_edges.entry(b_idx).or_default().push((face_idx, edge_idx, a_idx));
+            }
+        }
+
+        // Start from the seed edge, walk in both directions
+        let seed_face = &object.faces[fi];
+        let start_a = pos_to_idx(seed_face.positions[ei]);
+        let start_b = pos_to_idx(seed_face.positions[(ei + 1) % 4]);
+
+        let mut selected_edges = std::collections::HashSet::new();
+        selected_edges.insert((li, oi, fi, ei));
+
+        // Walk from start_b forward
+        let mut current = start_b;
+        let mut prev = start_a;
+        for _ in 0..1000 {
+            // Find edges connected to current vertex (excluding the one we came from)
+            let edges = match vert_edges.get(&current) {
+                Some(e) => e,
+                None => break,
+            };
+            let next_edges: Vec<_> = edges.iter()
+                .filter(|&&(_, _, other)| other != prev)
+                .copied()
+                .collect();
+            // Continue only if there's exactly one continuation (clean edge loop)
+            if next_edges.len() != 1 { break; }
+            let (nf, ne, next_vert) = next_edges[0];
+            selected_edges.insert((li, oi, nf, ne));
+            if next_vert == start_a { break; } // Completed the loop
+            prev = current;
+            current = next_vert;
+        }
+
+        // Walk from start_a backward
+        let mut current = start_a;
+        let mut prev = start_b;
+        for _ in 0..1000 {
+            let edges = match vert_edges.get(&current) {
+                Some(e) => e,
+                None => break,
+            };
+            let next_edges: Vec<_> = edges.iter()
+                .filter(|&&(_, _, other)| other != prev)
+                .copied()
+                .collect();
+            if next_edges.len() != 1 { break; }
+            let (nf, ne, next_vert) = next_edges[0];
+            if selected_edges.contains(&(li, oi, nf, ne)) { break; } // Already visited
+            selected_edges.insert((li, oi, nf, ne));
+            prev = current;
+            current = next_vert;
+        }
+
+        self.selection.edges = selected_edges.into_iter().collect();
+    }
+
+    /// Select faces connected to currently selected vertices.
+    pub fn select_faces_from_vertices(&mut self, scene: &Scene) {
+        if self.selection.vertices.is_empty() { return; }
+
+        let mut vertex_positions: Vec<Vec3> = Vec::new();
+        for &(li, oi, fi, vi) in &self.selection.vertices {
+            if let Some(face) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.faces.get(fi))
+            {
+                vertex_positions.push(face.positions[vi]);
+            }
+        }
+
+        self.selection.faces.clear();
+        let eps = 1e-5;
+        for (li, layer) in scene.layers.iter().enumerate() {
+            if !layer.visible { continue; }
+            for (oi, object) in layer.objects.iter().enumerate() {
+                for (fi, face) in object.faces.iter().enumerate() {
+                    if face.hidden { continue; }
+                    let has_selected_vert = face.positions.iter().any(|p| {
+                        vertex_positions.iter().any(|vp| (*p - *vp).length_squared() < eps)
+                    });
+                    if has_selected_vert {
+                        let entry = (li, oi, fi);
+                        if !self.selection.faces.contains(&entry) {
+                            self.selection.faces.push(entry);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Handle a left-click in edit mode — select the face/object under the cursor.

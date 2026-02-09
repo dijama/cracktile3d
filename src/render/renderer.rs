@@ -4,6 +4,7 @@ use wgpu::util::DeviceExt;
 use crate::input::InputState;
 use crate::render::camera::Camera;
 use crate::render::grid::GridRenderer;
+use crate::render::skybox::SkyboxRenderer;
 use crate::render::vertex::{LineVertex, Vertex};
 use crate::scene::Scene;
 use crate::scene::mesh::Face;
@@ -24,6 +25,8 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
 
     tile_pipeline: wgpu::RenderPipeline,
+    tile_pipeline_culled: wgpu::RenderPipeline,
+    pub backface_culling: bool,
     line_pipeline: wgpu::RenderPipeline,
     selection_line_pipeline: wgpu::RenderPipeline,
     grid: GridRenderer,
@@ -32,6 +35,21 @@ pub struct Renderer {
     placeholder_bind_group: wgpu::BindGroup,
 
     pub tile_bind_group_layout: wgpu::BindGroupLayout,
+
+    pub skybox: SkyboxRenderer,
+
+    // Lighting uniform
+    light_buffer: wgpu::Buffer,
+    light_bind_group: wgpu::BindGroup,
+    pub lighting_enabled: bool,
+    /// Direction toward light source (normalized).
+    pub light_direction: [f32; 3],
+    /// Light color RGB.
+    pub light_color: [f32; 3],
+    /// Light intensity multiplier.
+    pub light_intensity: f32,
+    /// Ambient light color RGB.
+    pub ambient_color: [f32; 3],
 }
 
 impl Renderer {
@@ -142,6 +160,38 @@ impl Renderer {
                 ],
             });
 
+        // Light uniform (3 vec4s = 48 bytes)
+        let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("light_uniform"),
+            size: 48,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let light_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("light_bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("light_bg"),
+            layout: &light_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: light_buffer.as_entire_binding(),
+            }],
+        });
+
         // Tile pipeline
         let tile_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_shader"),
@@ -150,7 +200,7 @@ impl Renderer {
 
         let tile_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile_pipeline_layout"),
-            bind_group_layouts: &[&camera_bind_group_layout, &tile_bind_group_layout],
+            bind_group_layouts: &[&camera_bind_group_layout, &tile_bind_group_layout, &light_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -176,6 +226,42 @@ impl Renderer {
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 cull_mode: None, // Tiles can be viewed from both sides
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let tile_pipeline_culled = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tile_pipeline_culled"),
+            layout: Some(&tile_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &tile_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::LAYOUT],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &tile_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -278,6 +364,7 @@ impl Renderer {
         });
 
         let grid = GridRenderer::new(&device, 20, 1.0);
+        let skybox = SkyboxRenderer::new(&device, &queue, surface_format);
 
         // Placeholder 1x1 white texture for untextured tiles
         let placeholder_texture = device.create_texture_with_data(
@@ -327,11 +414,21 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             tile_pipeline,
+            tile_pipeline_culled,
+            backface_culling: false,
             line_pipeline,
             selection_line_pipeline,
             grid,
+            skybox,
             placeholder_bind_group,
             tile_bind_group_layout,
+            light_buffer,
+            light_bind_group,
+            lighting_enabled: false,
+            light_direction: [0.5, 0.8, 0.3], // Default: slightly above-right-front
+            light_color: [1.0, 1.0, 0.95],
+            light_intensity: 0.8,
+            ambient_color: [0.3, 0.3, 0.35],
         }
     }
 
@@ -346,12 +443,27 @@ impl Renderer {
         self.camera.set_aspect(width as f32, height as f32);
     }
 
-    /// Upload per-frame data (camera, grid) before the render pass begins.
+    /// Upload per-frame data (camera, grid, skybox, lighting) before the render pass begins.
     pub fn prepare_frame(&mut self, scene: &Scene) {
         let vp = self.camera.view_projection();
         let vp_raw: [f32; 16] = vp.to_cols_array();
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&vp_raw));
         self.grid.upload(&self.queue, 20, 1.0, scene.crosshair_pos);
+
+        // Upload skybox uniform (inverse VP for ray direction reconstruction)
+        if self.skybox.enabled {
+            let inv_vp = vp.inverse();
+            self.skybox.prepare(&self.queue, inv_vp);
+        }
+
+        // Upload light uniform: direction(xyz) + enabled(w), color(rgb) + intensity(a), ambient(rgb) + pad
+        let enabled_f = if self.lighting_enabled { 1.0f32 } else { 0.0 };
+        let light_data: [f32; 12] = [
+            self.light_direction[0], self.light_direction[1], self.light_direction[2], enabled_f,
+            self.light_color[0], self.light_color[1], self.light_color[2], self.light_intensity,
+            self.ambient_color[0], self.ambient_color[1], self.ambient_color[2], 0.0,
+        ];
+        self.queue.write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&light_data));
     }
 
     pub fn render_scene<'a>(
@@ -361,6 +473,9 @@ impl Renderer {
         _input: &InputState,
         wireframe: bool,
     ) {
+        // Draw skybox behind everything
+        self.skybox.render(pass);
+
         // Draw grid
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -381,8 +496,10 @@ impl Renderer {
             self.render_wireframe(pass, scene);
         } else {
             // Draw scene objects as solid tiles
-            pass.set_pipeline(&self.tile_pipeline);
+            let pipeline = if self.backface_culling { &self.tile_pipeline_culled } else { &self.tile_pipeline };
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.light_bind_group, &[]);
 
             for layer in &scene.layers {
                 if !layer.visible {
@@ -540,12 +657,13 @@ impl Renderer {
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         faces: &[Face],
+        preview_color: Option<[f32; 4]>,
     ) {
         if faces.is_empty() {
             return;
         }
 
-        let color = [0.3, 1.0, 0.5, 1.0]; // Green
+        let color = preview_color.unwrap_or([0.3, 1.0, 0.5, 1.0]); // Default: green
         let mut line_verts: Vec<LineVertex> = Vec::new();
 
         for face in faces {
@@ -605,10 +723,176 @@ impl Renderer {
         pass.draw(0..line_verts.len() as u32, 0..1);
     }
 
-    /// Toggle lighting preview. Currently a no-op placeholder for future shader support.
-    pub fn set_lighting_enabled(&mut self, _enabled: bool) {
-        // TODO: When lighting shader is implemented, update the camera uniform buffer
-        // to include light direction and lighting-enabled flag.
+    /// Render the 3D transform gizmo.
+    pub fn render_gizmo<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        gizmo_verts: &[LineVertex],
+    ) {
+        if gizmo_verts.is_empty() {
+            return;
+        }
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gizmo_lines"),
+            contents: bytemuck::cast_slice(gizmo_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        pass.set_pipeline(&self.selection_line_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..gizmo_verts.len() as u32, 0..1);
+    }
+
+    /// Render skeleton bones as colored line segments.
+    pub fn render_bones<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        skeleton: &crate::bones::Skeleton,
+    ) {
+        let lines = skeleton.render_lines();
+        if lines.is_empty() {
+            return;
+        }
+
+        // Build line vertices: white for unselected, yellow for selected
+        let mut verts = Vec::with_capacity(lines.len() * 2);
+        for (i, (head, tail)) in lines.iter().enumerate() {
+            let color = if skeleton.bones[i].selected {
+                [1.0, 1.0, 0.0, 1.0]
+            } else {
+                [0.8, 0.8, 1.0, 1.0]
+            };
+            verts.push(LineVertex { position: (*head).into(), color });
+            verts.push(LineVertex { position: (*tail).into(), color });
+
+            // Draw small cross at head for visibility
+            let dir = (*tail - *head).normalize_or_zero();
+            let up = if dir.y.abs() > 0.9 {
+                glam::Vec3::X
+            } else {
+                glam::Vec3::Y
+            };
+            let right = dir.cross(up).normalize_or_zero() * 0.05;
+            let head_color = if skeleton.bones[i].selected {
+                [1.0, 0.5, 0.0, 1.0]
+            } else {
+                [0.5, 0.5, 1.0, 1.0]
+            };
+            verts.push(LineVertex { position: (*head - right).into(), color: head_color });
+            verts.push(LineVertex { position: (*head + right).into(), color: head_color });
+        }
+
+        let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bone_lines"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        pass.set_pipeline(&self.selection_line_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..));
+        pass.draw(0..verts.len() as u32, 0..1);
+    }
+
+    /// Toggle lighting preview.
+    pub fn set_lighting_enabled(&mut self, enabled: bool) {
+        self.lighting_enabled = enabled;
+    }
+
+    /// Capture the given surface texture to a PNG file.
+    pub fn capture_screenshot(
+        &self,
+        texture: &wgpu::Texture,
+        path: &std::path::Path,
+    ) -> Result<(), String> {
+        let width = self.config.width;
+        let height = self.config.height;
+
+        // Bytes per row must be aligned to 256 for wgpu
+        let bytes_per_pixel = 4u32;
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = 256u32;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+
+        let buffer_size = (padded_bytes_per_row * height) as u64;
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot_staging"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("screenshot_encoder") },
+        );
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map the buffer synchronously
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait);
+        receiver.recv()
+            .map_err(|e| format!("Buffer map failed: {e}"))?
+            .map_err(|e| format!("Buffer map error: {e}"))?;
+
+        let data = buffer_slice.get_mapped_range();
+
+        // Remove row padding and collect pixels
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for row in 0..height {
+            let offset = (row * padded_bytes_per_row) as usize;
+            let row_end = offset + (width * bytes_per_pixel) as usize;
+            pixels.extend_from_slice(&data[offset..row_end]);
+        }
+        drop(data);
+        staging_buffer.unmap();
+
+        // Convert BGRA to RGBA if needed (sRGB formats typically output BGRA on some backends)
+        // Actually, Rgba8UnormSrgb should give RGBA directly. But surface formats vary.
+        // If the surface format is Bgra8UnormSrgb, we need to swap channels.
+        if self.surface_format == wgpu::TextureFormat::Bgra8UnormSrgb
+            || self.surface_format == wgpu::TextureFormat::Bgra8Unorm
+        {
+            for chunk in pixels.chunks_exact_mut(4) {
+                chunk.swap(0, 2); // B <-> R
+            }
+        }
+
+        // Create output directory
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Save as PNG
+        let img = image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| "Failed to create image from pixels".to_string())?;
+        img.save(path).map_err(|e| format!("Failed to save screenshot: {e}"))?;
+
+        Ok(())
     }
 
     fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

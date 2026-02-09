@@ -1,3 +1,4 @@
 mod tileset;
+pub mod palette;
 
-pub use tileset::Tileset;
+pub use tileset::{Tileset, FilterMode, WrapMode, AlphaMode};

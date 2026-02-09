@@ -8,6 +8,10 @@ mod input;
 mod history;
 mod io;
 mod anim;
+mod bones;
+mod paint;
+mod keybindings;
+mod settings;
 mod util;
 
 use app::App;

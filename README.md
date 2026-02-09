@@ -9,20 +9,27 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 ### Draw Mode
 - **Tile** — Click to place a textured quad on the grid or adjacent to existing faces; hold and drag to paint continuously
 - **Sticky** — Extend tiles from the closest edge of an existing face
-- **Block** — Place a 6-face cube in one click
+- **Block** — Place a 6-face cube in one click; subtract mode erases faces inside the block volume
 - **Primitive** — Place box, cylinder, cone, sphere, or wedge shapes
 - **Vertex Color** — Paint per-vertex colors with configurable brush radius and opacity
+- **Prefab** — Create and place reusable object instances
 - **Camera-based placement plane** — Camera angle auto-selects XZ/XY/YZ plane; look from the front to build walls, look down to place floors
 - **Tilebrush transforms** — Rotate (R/Shift+R) and flip (F/G) tiles before placement
+- **Rectangle fill** — Shift+drag with Tile tool to fill a rectangular area
 - **Placement plane indicator** — Shows current plane (Top/Front/Side) in tools panel
 
 ### Edit Mode
 - **Selection levels** — Object, face, vertex, edge
-- **Transform** — Translate (arrow keys), rotate (R), scale (+/-), with grid snapping (Shift=fine, Ctrl=coarse)
+- **3D transform gizmo** — Visual translate/rotate/scale handles with click-drag interaction
+- **Transform** — Translate (arrow keys or gizmo), rotate, scale, with grid snapping (Shift=fine, Ctrl=coarse)
 - **Operations** — Flip normals, extrude, retile, subdivide, delete, merge vertices
-- **UV manipulation** — Rotate CW/CCW, flip horizontal/vertical
+- **Triangle operations** — Divide quads into triangles, merge adjacent triangles back to quads
+- **Vertex alignment** — Push/pull along normals, center to axis, straighten vertices
+- **UV manipulation** — Rotate CW/CCW, flip horizontal/vertical; floating UV editor panel (Ctrl+U)
+- **Auto-flatten UVs** — Optionally recompute UVs proportionally when vertices are moved
 - **Geometry** — Mirror X/Y/Z across crosshair plane
 - **Edge operations** — Split edge (quad to 2 quads), collapse edge (merge to midpoint)
+- **Advanced selection** — Select by normal, overlapping, tilebrush, edge loop, faces from vertices
 - **Selection tools** — Click, shift-click, marquee drag, select all, invert, select connected
 - **Copy/paste** — Ctrl+C/V with crosshair-relative placement
 - **Hide/show** — H to hide selected, Shift+H to show all (undoable)
@@ -41,19 +48,23 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 - Freelook mode (hold right-click + WASD in Edit mode)
 - Perspective/orthographic toggle (Numpad 5)
 - 5 camera bookmarks (Ctrl+Shift+1-5 to save, Ctrl+1-5 to recall)
+- Configurable FOV, sensitivity, zoom speed, invert Y axis
 
 ### File I/O
 - Native binary format (.ct3d) with save/load
-- Import from Wavefront OBJ (.obj)
-- Import from glTF Binary (.glb)
-- Export to Wavefront OBJ (.obj)
-- Export to glTF Binary (.glb)
+- Import from Wavefront OBJ (.obj) and glTF Binary (.glb)
+- Export to Wavefront OBJ (.obj) and glTF Binary (.glb)
+- Screenshot to PNG (F12)
 - Recent files menu (remembers last 10 files)
 
 ### UI
 - Tile placement preview (green wireframe ghost)
 - Hover highlight in Edit mode (blue wireframe)
 - Edge selection highlight (orange)
+- 3D ViewCube for quick camera orientation
+- Viewport rulers with world-space coordinate labels
+- Floating tileset panel (pop-out/dock with Ctrl+Shift+T)
+- Floating UV editor panel (Ctrl+U)
 - Clickable edit operation buttons (UV, geometry, edge ops)
 - Object tree in layers panel
 - Editable vertex positions, UVs, and colors in properties panel (with undo support)
@@ -61,7 +72,16 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 - Unsaved changes indicator
 - Background color picker
 - Wireframe toggle (Z)
+- Backface culling toggle
 - Lighting preview toggle
+- Skybox (gradient or equirectangular panorama)
+
+### Customization
+- Customizable keybindings (Edit > Keybindings...) with JSON persistence
+- Settings/preferences system (Edit > Preferences...) with per-category tabs
+- Configurable colors for grid, wireframe, selection, vertices, edges, hover, preview
+- Camera sensitivity, FOV, near/far plane, invert Y axis
+- Auto-flatten UVs on vertex edit (optional)
 
 ## Controls
 
@@ -73,8 +93,11 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 | Ctrl+S | Save |
 | Ctrl+O | Open |
 | Ctrl+N | New scene |
+| F12 | Screenshot |
 | Z | Toggle wireframe |
 | [ / ] | Decrease / increase grid size |
+| Ctrl+U | Toggle UV editor panel |
+| Ctrl+Shift+T | Toggle floating tileset panel |
 | Numpad 5 | Toggle perspective/orthographic |
 | Numpad 1/3/7 | Front / Right / Top view |
 | Ctrl+Numpad 1/3/7 | Back / Left / Bottom view |
@@ -90,6 +113,7 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 | G | Flip tilebrush horizontally |
 | Left click | Place tile |
 | Left click + drag | Paint tiles continuously (Tile tool) |
+| Shift+click + drag | Rectangle fill (Tile tool) |
 | Right click | Erase tile |
 | Alt+Right click | Eyedropper (pick tile from face) |
 
@@ -115,6 +139,8 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 | Ctrl+C / Ctrl+V | Copy / Paste |
 | Alt+D | Subdivide faces |
 | Enter | Create object from selection |
+| T / R / Y | Gizmo: Translate / Rotate / Scale |
+| 1 / 2 / 3 / 4 | Selection: Object / Face / Edge / Vertex |
 | Ctrl+Shift+1-5 | Save camera bookmark |
 | Ctrl+1-5 | Recall camera bookmark |
 | Right-click + WASD | Freelook camera |
@@ -160,18 +186,30 @@ src/
 │   ├── renderer.rs      # wgpu pipelines, scene rendering
 │   ├── camera.rs        # Orbit/freelook camera, bookmarks
 │   ├── grid.rs          # XZ grid + crosshair + elevated grid
-│   └── shaders/         # WGSL shaders (tile + line)
+│   ├── gizmo.rs         # 3D transform gizmo (translate/rotate/scale)
+│   ├── skybox.rs        # Gradient + equirect panorama skybox
+│   └── shaders/         # WGSL shaders (tile, line, skybox)
 ├── scene/
 │   ├── mod.rs           # Scene, Layer structs
 │   ├── object.rs        # Object with GPU mesh batching
-│   └── mesh.rs          # Face (quad) geometry, tangent_basis
+│   └── mesh.rs          # Face (quad) geometry, tangent_basis, flatten_uvs
 ├── tools/
 │   ├── draw/            # Draw tools, placement, tilebrush, primitives
 │   └── edit/            # Selection, transforms, marquee
-├── ui/                  # egui panels (tools, layers, tileset, properties)
+├── ui/
+│   ├── mod.rs           # Menu bar, status bar, settings/keybindings dialogs
+│   ├── tools_panel.rs   # Draw/Edit tools (left panel)
+│   ├── tileset_panel.rs # Tileset browser (bottom/floating)
+│   ├── layers_panel.rs  # Layers + object tree (right panel)
+│   ├── properties_panel.rs # Face properties editor
+│   ├── uv_panel.rs      # Floating UV editor
+│   ├── viewcube.rs      # 3D orientation cube overlay
+│   └── rulers.rs        # Viewport rulers with coordinate labels
 ├── history/             # Undo/redo command pattern (30+ command types)
 ├── tile/                # Tileset loading, UV computation
 ├── io/                  # Save/load (.ct3d), import/export (OBJ, GLB)
+├── keybindings.rs       # Customizable keybinding system
+├── settings.rs          # Persistent user preferences
 └── util/                # Raycasting, picking, screen projection
 ```
 

@@ -1,3 +1,4 @@
+use crate::scene::Scene;
 use crate::tools::ToolMode;
 use crate::tools::draw::{DrawState, DrawTool, PrimitiveShape};
 use crate::tools::edit::{EditState, SelectionLevel, GizmoMode};
@@ -9,7 +10,7 @@ pub fn draw_tools_panel(
     tool_mode: &mut ToolMode,
     draw_state: &mut DrawState,
     edit_state: &mut EditState,
-    crosshair_pos: glam::Vec3,
+    scene: &mut Scene,
 ) -> UiAction {
     let mut action = UiAction::None;
     egui::SidePanel::left("tools_panel").default_width(180.0).show(ctx, |ui| {
@@ -23,25 +24,26 @@ pub fn draw_tools_panel(
 
         match tool_mode {
             ToolMode::Draw => {
-                draw_draw_tools(ui, draw_state);
+                draw_draw_tools(ui, draw_state, scene);
             }
             ToolMode::Edit => {
-                action = draw_edit_tools(ui, edit_state);
+                action = draw_edit_tools(ui, edit_state, scene);
             }
         }
 
         ui.separator();
         ui.heading("Crosshair");
+        let cp = scene.crosshair_pos;
         ui.label(format!(
             "({:.1}, {:.1}, {:.1})",
-            crosshair_pos.x, crosshair_pos.y, crosshair_pos.z
+            cp.x, cp.y, cp.z
         ));
         ui.small("WASD + Q/E to move");
     });
     action
 }
 
-fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
+fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState, scene: &mut Scene) {
     ui.heading("Draw Tools");
     let tools = [
         (DrawTool::Tile, "Tile", "1"),
@@ -49,6 +51,7 @@ fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
         (DrawTool::Block, "Block", "3"),
         (DrawTool::Primitive, "Primitive", "4"),
         (DrawTool::VertexColor, "Vtx Color", "5"),
+        (DrawTool::Prefab, "Prefab", "6"),
     ];
     for (tool, label, key) in &tools {
         let selected = draw_state.tool == *tool;
@@ -104,7 +107,15 @@ fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
             ui.small("Right click: erase tile");
         }
         DrawTool::Block => {
-            ui.small("Click: place 6-face cube");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut draw_state.block_subtract, false, "Add");
+                ui.selectable_value(&mut draw_state.block_subtract, true, "Subtract");
+            });
+            if draw_state.block_subtract {
+                ui.small("Click: remove faces inside block volume");
+            } else {
+                ui.small("Click: place 6-face cube");
+            }
             ui.small("Right click: erase tile");
         }
         DrawTool::Primitive => {
@@ -135,6 +146,37 @@ fn draw_draw_tools(ui: &mut egui::Ui, draw_state: &mut DrawState) {
             ui.small("Click face: paint all vertices");
             ui.small("Shift+click: paint closest vertex");
         }
+        DrawTool::Prefab => {
+            ui.heading("Prefab");
+            if scene.prefabs.is_empty() {
+                ui.label("No prefabs yet.");
+                ui.small("Select faces in Edit mode,");
+                ui.small("then use Create Prefab.");
+            } else {
+                let current_name = scene.active_prefab
+                    .and_then(|i| scene.prefabs.get(i))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "None".to_string());
+
+                egui::ComboBox::from_id_salt("prefab_selector")
+                    .selected_text(&current_name)
+                    .show_ui(ui, |ui| {
+                        for (i, prefab) in scene.prefabs.iter().enumerate() {
+                            let sel = scene.active_prefab == Some(i);
+                            if ui.selectable_label(sel, &prefab.name).clicked() {
+                                scene.active_prefab = Some(i);
+                            }
+                        }
+                    });
+
+                if let Some(idx) = scene.active_prefab
+                    && let Some(prefab) = scene.prefabs.get(idx)
+                {
+                    ui.label(format!("{} faces", prefab.faces.len()));
+                }
+            }
+            ui.small("Click: place prefab at crosshair");
+        }
     }
     ui.separator();
     ui.small("R/Shift+R: rotate tile | F: flip V | G: flip H");
@@ -153,7 +195,7 @@ fn placement_plane_label(normal: glam::Vec3) -> &'static str {
     }
 }
 
-fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {
+fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState, scene: &mut Scene) -> UiAction {
     let mut action = UiAction::None;
 
     ui.heading("Selection Level");
@@ -260,6 +302,70 @@ fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {
         }
     });
 
+    // Triangle operations
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_faces, egui::Button::new("Tri Divide \\")).on_hover_text("Split quads into triangles (0→2 diagonal)").clicked() {
+            action = UiAction::TriangleDivide(0);
+        }
+        if ui.add_enabled(has_faces, egui::Button::new("Tri Divide /")).on_hover_text("Split quads into triangles (1→3 diagonal)").clicked() {
+            action = UiAction::TriangleDivide(1);
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_faces, egui::Button::new("Tri Merge")).on_hover_text("Merge selected triangle pairs into quads").clicked() {
+            action = UiAction::TriangleMerge;
+        }
+        if ui.button("Select Tris").on_hover_text("Select all degenerate (triangular) faces").clicked() {
+            action = UiAction::SelectTriangles;
+        }
+    });
+
+    // Vertex alignment operations
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_selection, egui::Button::new("Push")).on_hover_text("Move verts outward along face normals").clicked() {
+            action = UiAction::PushVertices;
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Pull")).on_hover_text("Move verts inward along face normals").clicked() {
+            action = UiAction::PullVertices;
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Straighten")).on_hover_text("Flatten verts onto best-fit plane").clicked() {
+            action = UiAction::StraightenVertices;
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(has_selection, egui::Button::new("Center X")).on_hover_text("Align to crosshair X").clicked() {
+            action = UiAction::CenterToX;
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Center Y")).on_hover_text("Align to crosshair Y").clicked() {
+            action = UiAction::CenterToY;
+        }
+        if ui.add_enabled(has_selection, egui::Button::new("Center Z")).on_hover_text("Align to crosshair Z").clicked() {
+            action = UiAction::CenterToZ;
+        }
+    });
+
+    // Prefab operations
+    ui.separator();
+    ui.heading("Prefab");
+    if ui.add_enabled(has_faces, egui::Button::new("Create Prefab")).clicked() {
+        action = UiAction::CreatePrefab;
+    }
+    if !scene.prefabs.is_empty() {
+        // Show prefab list with delete buttons
+        let mut del_idx = None;
+        for (i, prefab) in scene.prefabs.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} ({})", &prefab.name, prefab.faces.len()));
+                if ui.small_button("x").on_hover_text("Delete prefab").clicked() {
+                    del_idx = Some(i);
+                }
+            });
+        }
+        if let Some(idx) = del_idx {
+            action = UiAction::DeletePrefab(idx);
+        }
+    }
+
     ui.separator();
     ui.heading("Select");
     ui.horizontal(|ui| {
@@ -267,6 +373,38 @@ fn draw_edit_tools(ui: &mut egui::Ui, edit_state: &mut EditState) -> UiAction {
         if ui.button("None").clicked() { action = UiAction::DeselectAll; }
         if ui.button("Invert").clicked() { action = UiAction::InvertSelection; }
     });
+
+    // Bones section
+    ui.separator();
+    ui.heading("Bones");
+    if ui.button("Add Bone").clicked() {
+        action = UiAction::AddBone;
+    }
+    let bone_count = scene.skeleton.bones.len();
+    if bone_count > 0 {
+        let mut del_idx = None;
+        let mut toggle_idx = None;
+        for i in 0..bone_count {
+            let selected = scene.skeleton.bones[i].selected;
+            let name = scene.skeleton.bones[i].name.clone();
+            ui.horizontal(|ui| {
+                if ui.selectable_label(selected, &name).clicked() {
+                    toggle_idx = Some(i);
+                }
+                if ui.small_button("x").on_hover_text("Delete bone").clicked() {
+                    del_idx = Some(i);
+                }
+            });
+        }
+        if let Some(idx) = toggle_idx {
+            let shift = ui.input(|i| i.modifiers.shift);
+            scene.skeleton.select_bone(idx, shift);
+        }
+        if let Some(idx) = del_idx {
+            action = UiAction::DeleteBone(idx);
+        }
+    }
+    ui.label(format!("{bone_count} bones"));
 
     ui.separator();
     ui.small("Click: select, Shift+click: add");

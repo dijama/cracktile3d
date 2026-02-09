@@ -5,8 +5,51 @@ pub use object::Object;
 use glam::Vec3;
 use serde::{Serialize, Deserialize};
 use crate::tile::Tileset;
+use crate::scene::mesh::Face;
+use crate::bones::Skeleton;
+use crate::tile::palette::Palette;
 
 pub const GRID_PRESETS: &[f32] = &[0.125, 0.25, 0.5, 1.0, 2.0, 4.0];
+
+/// A reusable prefab template (geometry + metadata).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Prefab {
+    pub name: String,
+    pub faces: Vec<Face>,
+    /// Offset from prefab origin (centroid computed at creation).
+    pub origin: Vec3,
+    /// Tileset index this prefab was created from.
+    pub tileset_index: Option<usize>,
+}
+
+impl Prefab {
+    /// Create a prefab from a set of faces. Computes centroid as origin.
+    pub fn from_faces(name: String, faces: Vec<Face>, tileset_index: Option<usize>) -> Self {
+        let origin = if faces.is_empty() {
+            Vec3::ZERO
+        } else {
+            let sum: Vec3 = faces.iter()
+                .flat_map(|f| f.positions.iter())
+                .copied()
+                .sum();
+            let count = (faces.len() * 4) as f32;
+            sum / count
+        };
+        Self { name, faces, origin, tileset_index }
+    }
+
+    /// Return faces translated so origin is at `position`.
+    pub fn instantiate_at(&self, position: Vec3) -> Vec<Face> {
+        let offset = position - self.origin;
+        self.faces.iter().map(|f| {
+            let mut nf = f.clone();
+            for p in &mut nf.positions {
+                *p += offset;
+            }
+            nf
+        }).collect()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Scene {
@@ -23,6 +66,21 @@ pub struct Scene {
     /// Objects that need GPU mesh rebuild after property edits. Cleared each frame by app.
     #[serde(skip)]
     pub dirty_objects: Vec<(usize, usize)>,
+    /// Prefab library — reusable geometry templates.
+    #[serde(default)]
+    pub prefabs: Vec<Prefab>,
+    /// Currently selected prefab for placement.
+    #[serde(skip)]
+    pub active_prefab: Option<usize>,
+    /// Skeleton for bone-based animation.
+    #[serde(default)]
+    pub skeleton: Skeleton,
+    /// Tile palettes for randomized/sequenced placement.
+    #[serde(default)]
+    pub palettes: Vec<Palette>,
+    /// Active palette index (None = direct tile selection).
+    #[serde(skip)]
+    pub active_palette: Option<usize>,
 }
 
 fn default_grid_preset_index() -> usize { 3 }
@@ -49,6 +107,11 @@ impl Scene {
             tilesets: Vec::new(),
             active_tileset: None,
             dirty_objects: Vec::new(),
+            prefabs: Vec::new(),
+            active_prefab: None,
+            skeleton: Skeleton::new(),
+            palettes: Vec::new(),
+            active_palette: None,
         }
     }
 }

@@ -53,8 +53,10 @@ impl Face {
     }
 
     pub fn vertices(&self) -> [Vertex; 4] {
+        let n: [f32; 3] = self.normal().into();
         std::array::from_fn(|i| Vertex {
             position: self.positions[i].into(),
+            normal: n,
             uv: self.uvs[i].into(),
             color: self.colors[i].into(),
         })
@@ -69,6 +71,42 @@ impl Face {
         let e1 = self.positions[1] - self.positions[0];
         let e2 = self.positions[3] - self.positions[0];
         e1.cross(e2).normalize()
+    }
+
+    /// Re-flatten UVs based on current vertex positions, preserving the original UV bounding box.
+    /// Projects the 3D face shape onto 2D using the face normal's tangent basis,
+    /// then maps to the original UV extents.
+    pub fn flatten_uvs(&mut self) {
+        let n = self.normal();
+        if n.length_squared() < 0.001 {
+            return; // degenerate face
+        }
+        let (right, up) = tangent_basis(n);
+
+        // Project positions to 2D (tangent plane)
+        let projected: [Vec2; 4] = std::array::from_fn(|i| {
+            Vec2::new(self.positions[i].dot(right), self.positions[i].dot(up))
+        });
+
+        // Compute bounding box of projected positions
+        let p_min = projected.iter().fold(Vec2::splat(f32::MAX), |a, &b| a.min(b));
+        let p_max = projected.iter().fold(Vec2::splat(f32::MIN), |a, &b| a.max(b));
+        let p_size = p_max - p_min;
+
+        if p_size.x < 1e-6 || p_size.y < 1e-6 {
+            return; // face is a line or point
+        }
+
+        // Compute original UV bounding box
+        let uv_min = self.uvs.iter().fold(Vec2::splat(f32::MAX), |a, &b| a.min(b));
+        let uv_max = self.uvs.iter().fold(Vec2::splat(f32::MIN), |a, &b| a.max(b));
+        let uv_size = uv_max - uv_min;
+
+        // Map projected positions to UV space
+        for (proj, uv) in projected.iter().zip(self.uvs.iter_mut()) {
+            let t = (*proj - p_min) / p_size; // normalized [0,1]
+            *uv = uv_min + t * uv_size;
+        }
     }
 }
 

@@ -753,3 +753,525 @@ pub fn export_glb(scene: &Scene, path: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
+/// Export the scene as a glTF 2.0 (JSON + separate .bin) file.
+pub fn export_gltf(scene: &Scene, path: &Path) -> Result<(), String> {
+    let (json, bin) = build_gltf_json_and_bin(scene)?;
+
+    // Determine .bin path (same name, .bin extension)
+    let bin_filename = path.file_stem()
+        .map(|s| format!("{}.bin", s.to_string_lossy()))
+        .unwrap_or_else(|| "scene.bin".to_string());
+    let bin_path = path.with_file_name(&bin_filename);
+
+    // Modify JSON to reference external bin file
+    let json_with_uri = json.replace(
+        &format!(r#""byteLength":{}}}}}"#, bin.len()),
+        &format!(r#""byteLength":{},"uri":"{}"}}}}"#, bin.len(), bin_filename),
+    );
+
+    fs::write(path, &json_with_uri).map_err(|e| format!("Write JSON failed: {e}"))?;
+    fs::write(&bin_path, &bin).map_err(|e| format!("Write BIN failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Build glTF JSON string and binary buffer from scene (shared by GLB and glTF export).
+fn build_gltf_json_and_bin(scene: &Scene) -> Result<(String, Vec<u8>), String> {
+    let mut bin: Vec<u8> = Vec::new();
+    let mut json_accessors = Vec::new();
+    let mut json_buffer_views = Vec::new();
+    let mut json_meshes = Vec::new();
+    let mut json_nodes = Vec::new();
+    let mut node_indices = Vec::new();
+
+    for layer in &scene.layers {
+        if !layer.visible { continue; }
+        for object in &layer.objects {
+            let visible_faces: Vec<_> = object.faces.iter().filter(|f| !f.hidden).collect();
+            if visible_faces.is_empty() { continue; }
+
+            let vertex_count = visible_faces.len() * 4;
+            let index_count = visible_faces.len() * 6;
+
+            let mut positions: Vec<f32> = Vec::with_capacity(vertex_count * 3);
+            let mut texcoords: Vec<f32> = Vec::with_capacity(vertex_count * 2);
+            let mut colors: Vec<f32> = Vec::with_capacity(vertex_count * 4);
+            let mut indices: Vec<u32> = Vec::with_capacity(index_count);
+            let mut min_pos = [f32::MAX; 3];
+            let mut max_pos = [f32::MIN; 3];
+
+            for face in &visible_faces {
+                let base = (positions.len() / 3) as u32;
+                for i in 0..4 {
+                    let p = face.positions[i];
+                    positions.extend_from_slice(&[p.x, p.y, p.z]);
+                    min_pos[0] = min_pos[0].min(p.x);
+                    min_pos[1] = min_pos[1].min(p.y);
+                    min_pos[2] = min_pos[2].min(p.z);
+                    max_pos[0] = max_pos[0].max(p.x);
+                    max_pos[1] = max_pos[1].max(p.y);
+                    max_pos[2] = max_pos[2].max(p.z);
+                    texcoords.extend_from_slice(&[face.uvs[i].x, face.uvs[i].y]);
+                    let c = face.colors[i];
+                    colors.extend_from_slice(&[c.x, c.y, c.z, c.w]);
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+
+            let mut append = |data: &[u8]| -> (usize, usize) {
+                let offset = bin.len();
+                bin.extend_from_slice(data);
+                let len = data.len();
+                while !bin.len().is_multiple_of(4) { bin.push(0); }
+                (offset, len)
+            };
+
+            let (pos_off, pos_len) = append(bytemuck::cast_slice::<f32, u8>(&positions));
+            let pos_bv = json_buffer_views.len();
+            json_buffer_views.push(format!(
+                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+                pos_off, pos_len
+            ));
+            let pos_acc = json_accessors.len();
+            json_accessors.push(format!(
+                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}}"#,
+                pos_bv, vertex_count,
+                min_pos[0], min_pos[1], min_pos[2],
+                max_pos[0], max_pos[1], max_pos[2],
+            ));
+
+            let (tc_off, tc_len) = append(bytemuck::cast_slice::<f32, u8>(&texcoords));
+            let tc_bv = json_buffer_views.len();
+            json_buffer_views.push(format!(
+                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+                tc_off, tc_len
+            ));
+            let tc_acc = json_accessors.len();
+            json_accessors.push(format!(
+                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC2"}}"#,
+                tc_bv, vertex_count,
+            ));
+
+            let (col_off, col_len) = append(bytemuck::cast_slice::<f32, u8>(&colors));
+            let col_bv = json_buffer_views.len();
+            json_buffer_views.push(format!(
+                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+                col_off, col_len
+            ));
+            let col_acc = json_accessors.len();
+            json_accessors.push(format!(
+                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC4"}}"#,
+                col_bv, vertex_count,
+            ));
+
+            let (idx_off, idx_len) = append(bytemuck::cast_slice::<u32, u8>(&indices));
+            let idx_bv = json_buffer_views.len();
+            json_buffer_views.push(format!(
+                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34963}}"#,
+                idx_off, idx_len
+            ));
+            let idx_acc = json_accessors.len();
+            json_accessors.push(format!(
+                r#"{{"bufferView":{},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
+                idx_bv, index_count,
+            ));
+
+            let mesh_idx = json_meshes.len();
+            let escaped_name = object.name.replace('\\', "\\\\").replace('"', "\\\"");
+            json_meshes.push(format!(
+                r#"{{"name":"{}","primitives":[{{"attributes":{{"POSITION":{},"TEXCOORD_0":{},"COLOR_0":{}}},"indices":{},"mode":4}}]}}"#,
+                escaped_name, pos_acc, tc_acc, col_acc, idx_acc,
+            ));
+
+            let node_idx = json_nodes.len();
+            json_nodes.push(format!(
+                r#"{{"name":"{}","mesh":{}}}"#,
+                escaped_name, mesh_idx,
+            ));
+            node_indices.push(node_idx);
+        }
+    }
+
+    if json_meshes.is_empty() {
+        return Err("No visible geometry to export".to_string());
+    }
+
+    let node_list: Vec<String> = node_indices.iter().map(|i| i.to_string()).collect();
+    let mut json = String::new();
+    write!(json, r#"{{"asset":{{"version":"2.0","generator":"Cracktile 3D"}}"#).unwrap();
+    write!(json, r#","scene":0,"scenes":[{{"nodes":[{}]}}]"#, node_list.join(",")).unwrap();
+    write!(json, r#","nodes":[{}]"#, json_nodes.join(",")).unwrap();
+    write!(json, r#","meshes":[{}]"#, json_meshes.join(",")).unwrap();
+    write!(json, r#","accessors":[{}]"#, json_accessors.join(",")).unwrap();
+    write!(json, r#","bufferViews":[{}]"#, json_buffer_views.join(",")).unwrap();
+    write!(json, r#","buffers":[{{"byteLength":{}}}]}}"#, bin.len()).unwrap();
+
+    Ok((json, bin))
+}
+
+/// Export the scene as a Collada DAE file.
+pub fn export_dae(scene: &Scene, path: &Path) -> Result<(), String> {
+    let mut out = String::new();
+    writeln!(out, r#"<?xml version="1.0" encoding="utf-8"?>"#).unwrap();
+    writeln!(out, r#"<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">"#).unwrap();
+    writeln!(out, r#"  <asset>"#).unwrap();
+    writeln!(out, r#"    <contributor><authoring_tool>Cracktile 3D</authoring_tool></contributor>"#).unwrap();
+    writeln!(out, r#"    <up_axis>Y_UP</up_axis>"#).unwrap();
+    writeln!(out, r#"  </asset>"#).unwrap();
+
+    // Collect geometries
+    writeln!(out, r#"  <library_geometries>"#).unwrap();
+
+    let mut geo_idx = 0;
+    let mut geo_names: Vec<(String, String)> = Vec::new(); // (geo_id, name)
+
+    for layer in &scene.layers {
+        if !layer.visible { continue; }
+        for object in &layer.objects {
+            let visible_faces: Vec<_> = object.faces.iter().filter(|f| !f.hidden).collect();
+            if visible_faces.is_empty() { continue; }
+
+            let geo_id = format!("geometry{geo_idx}");
+            let safe_name = xml_escape(&object.name);
+            geo_names.push((geo_id.clone(), safe_name.clone()));
+
+            writeln!(out, "    <geometry id=\"{geo_id}\" name=\"{safe_name}\">").unwrap();
+            writeln!(out, "      <mesh>").unwrap();
+
+            // Positions
+            let vert_count = visible_faces.len() * 4;
+            let pos_id = format!("{geo_id}-positions");
+            let pos_arr_id = format!("{geo_id}-positions-array");
+            write!(out, "        <source id=\"{pos_id}\"><float_array id=\"{pos_arr_id}\" count=\"{}\">", vert_count * 3).unwrap();
+            for face in &visible_faces {
+                for i in 0..4 {
+                    let p = face.positions[i];
+                    write!(out, "{} {} {} ", p.x, p.y, p.z).unwrap();
+                }
+            }
+            writeln!(out, "</float_array>").unwrap();
+            writeln!(out, "          <technique_common><accessor source=\"#{pos_arr_id}\" count=\"{vert_count}\" stride=\"3\">").unwrap();
+            writeln!(out, "            <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>").unwrap();
+            writeln!(out, "          </accessor></technique_common></source>").unwrap();
+
+            // UVs
+            let map_id = format!("{geo_id}-map");
+            let map_arr_id = format!("{geo_id}-map-array");
+            write!(out, "        <source id=\"{map_id}\"><float_array id=\"{map_arr_id}\" count=\"{}\">", vert_count * 2).unwrap();
+            for face in &visible_faces {
+                for i in 0..4 {
+                    write!(out, "{} {} ", face.uvs[i].x, face.uvs[i].y).unwrap();
+                }
+            }
+            writeln!(out, "</float_array>").unwrap();
+            writeln!(out, "          <technique_common><accessor source=\"#{map_arr_id}\" count=\"{vert_count}\" stride=\"2\">").unwrap();
+            writeln!(out, "            <param name=\"S\" type=\"float\"/><param name=\"T\" type=\"float\"/>").unwrap();
+            writeln!(out, "          </accessor></technique_common></source>").unwrap();
+
+            // Vertices
+            let vert_id = format!("{geo_id}-vertices");
+            writeln!(out, "        <vertices id=\"{vert_id}\"><input semantic=\"POSITION\" source=\"#{pos_id}\"/></vertices>").unwrap();
+
+            // Triangles (quads → 2 triangles each)
+            let tri_count = visible_faces.len() * 2;
+            writeln!(out, "        <triangles count=\"{tri_count}\">").unwrap();
+            writeln!(out, "          <input semantic=\"VERTEX\" source=\"#{vert_id}\" offset=\"0\"/>").unwrap();
+            writeln!(out, "          <input semantic=\"TEXCOORD\" source=\"#{map_id}\" offset=\"1\" set=\"0\"/>").unwrap();
+            write!(out, "          <p>").unwrap();
+            for (fi, _face) in visible_faces.iter().enumerate() {
+                let base = fi * 4;
+                // Triangle 1: 0,1,2
+                write!(out, "{b} {b} {} {} {} {} ", base + 1, base + 1, base + 2, base + 2, b = base).unwrap();
+                // Triangle 2: 0,2,3
+                write!(out, "{b} {b} {} {} {} {} ", base + 2, base + 2, base + 3, base + 3, b = base).unwrap();
+            }
+            writeln!(out, "</p>").unwrap();
+            writeln!(out, "        </triangles>").unwrap();
+
+            writeln!(out, "      </mesh>").unwrap();
+            writeln!(out, "    </geometry>").unwrap();
+            geo_idx += 1;
+        }
+    }
+
+    writeln!(out, r#"  </library_geometries>"#).unwrap();
+
+    // Visual scene
+    writeln!(out, r#"  <library_visual_scenes>"#).unwrap();
+    writeln!(out, r#"    <visual_scene id="Scene" name="Scene">"#).unwrap();
+    for (geo_id, name) in &geo_names {
+        let node_id = format!("{geo_id}-node");
+        writeln!(out, "      <node id=\"{node_id}\" name=\"{name}\" type=\"NODE\">").unwrap();
+        writeln!(out, "        <instance_geometry url=\"#{geo_id}\"/>").unwrap();
+        writeln!(out, "      </node>").unwrap();
+    }
+    writeln!(out, "    </visual_scene>").unwrap();
+    writeln!(out, "  </library_visual_scenes>").unwrap();
+
+    writeln!(out, "  <scene><instance_visual_scene url=\"#Scene\"/></scene>").unwrap();
+    writeln!(out, "</COLLADA>").unwrap();
+
+    fs::write(path, &out).map_err(|e| format!("Write failed: {e}"))
+}
+
+/// Import a glTF 2.0 (JSON) file. Returns a list of (faces, optional_name) per mesh.
+pub fn import_gltf(path: &Path) -> Result<Vec<(Vec<Face>, Option<String>)>, String> {
+    let json_str = fs::read_to_string(path)
+        .map_err(|e| format!("Read failed: {e}"))?;
+
+    // Find the buffer URI to load the .bin file
+    let bin = if let Some(uri) = extract_json_string(&json_str, "uri") {
+        let bin_path = path.parent()
+            .map(|p| p.join(&uri))
+            .unwrap_or_else(|| PathBuf::from(&uri));
+        fs::read(&bin_path)
+            .map_err(|e| format!("Read .bin failed: {e}"))?
+    } else {
+        Vec::new()
+    };
+
+    let buffer_views = parse_glb_buffer_views(&json_str);
+    let accessors = parse_glb_accessors(&json_str);
+    let meshes = parse_glb_meshes(&json_str);
+
+    import_from_gltf_data(&meshes, &accessors, &buffer_views, &bin)
+}
+
+/// Import a Collada DAE file. Returns a list of (faces, optional_name) per geometry.
+pub fn import_dae(path: &Path) -> Result<Vec<(Vec<Face>, Option<String>)>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Read failed: {e}"))?;
+
+    let mut objects: Vec<(Vec<Face>, Option<String>)> = Vec::new();
+
+    // Find each <geometry> block
+    let mut search_from = 0;
+    while let Some(geo_start) = content[search_from..].find("<geometry") {
+        let geo_start = search_from + geo_start;
+        let Some(geo_end) = content[geo_start..].find("</geometry>") else { break };
+        let geo_end = geo_start + geo_end + "</geometry>".len();
+        let geo_block = &content[geo_start..geo_end];
+
+        let name = extract_xml_attr(geo_block, "geometry", "name");
+
+        // Parse position float array
+        let positions = parse_dae_float_source(geo_block, "positions");
+        let texcoords = parse_dae_float_source(geo_block, "map");
+
+        // Parse triangle indices from <p> element
+        let indices = parse_dae_p_indices(geo_block);
+
+        // Determine input count (how many inputs per vertex in <p>)
+        let input_count = count_dae_triangle_inputs(geo_block);
+
+        let mut faces = Vec::new();
+        if input_count > 0 && !positions.is_empty() {
+            let stride = input_count;
+            let mut i = 0;
+            while i + stride * 3 <= indices.len() {
+                // Extract 3 vertex indices for a triangle
+                let vi0 = indices[i] as usize;
+                let ti0 = if stride > 1 { indices[i + 1] as usize } else { vi0 };
+                let vi1 = indices[i + stride] as usize;
+                let ti1 = if stride > 1 { indices[i + stride + 1] as usize } else { vi1 };
+                let vi2 = indices[i + stride * 2] as usize;
+                let ti2 = if stride > 1 { indices[i + stride * 2 + 1] as usize } else { vi2 };
+
+                let get_pos = |vi: usize| {
+                    let base = vi * 3;
+                    if base + 2 < positions.len() {
+                        Vec3::new(positions[base], positions[base + 1], positions[base + 2])
+                    } else {
+                        Vec3::ZERO
+                    }
+                };
+                let get_uv = |ti: usize| {
+                    let base = ti * 2;
+                    if base + 1 < texcoords.len() {
+                        Vec2::new(texcoords[base], texcoords[base + 1])
+                    } else {
+                        Vec2::ZERO
+                    }
+                };
+
+                // Try to pair with next triangle into a quad
+                if i + stride * 6 <= indices.len() {
+                    let vi3 = indices[i + stride * 3] as usize;
+                    let _ti3 = if stride > 1 { indices[i + stride * 3 + 1] as usize } else { vi3 };
+                    let vi4 = indices[i + stride * 4] as usize;
+                    let ti4 = if stride > 1 { indices[i + stride * 4 + 1] as usize } else { vi4 };
+                    let vi5 = indices[i + stride * 5] as usize;
+                    let ti5 = if stride > 1 { indices[i + stride * 5 + 1] as usize } else { vi5 };
+
+                    let n1 = (get_pos(vi1) - get_pos(vi0)).cross(get_pos(vi2) - get_pos(vi0));
+                    let n2 = (get_pos(vi4) - get_pos(vi3)).cross(get_pos(vi5) - get_pos(vi3));
+                    let coplanar = n1.normalize_or_zero().dot(n2.normalize_or_zero()) > 0.99;
+                    let shared = (vi0 == vi3 && vi2 == vi4) || (vi0 == vi5 && vi2 == vi3) || (vi1 == vi3 && vi2 == vi5);
+
+                    if coplanar && shared {
+                        let (q, qt) = if vi0 == vi3 && vi2 == vi4 {
+                            ([vi0, vi1, vi2, vi5], [ti0, ti1, ti2, ti5])
+                        } else if vi0 == vi5 && vi2 == vi3 {
+                            ([vi0, vi1, vi2, vi4], [ti0, ti1, ti2, ti4])
+                        } else {
+                            ([vi0, vi1, vi5, vi2], [ti0, ti1, ti5, ti2])
+                        };
+                        faces.push(Face {
+                            positions: [get_pos(q[0]), get_pos(q[1]), get_pos(q[2]), get_pos(q[3])],
+                            uvs: [get_uv(qt[0]), get_uv(qt[1]), get_uv(qt[2]), get_uv(qt[3])],
+                            colors: [Vec4::ONE; 4],
+                            hidden: false,
+                        });
+                        i += stride * 6;
+                        continue;
+                    }
+                }
+
+                // Single triangle → degenerate quad
+                faces.push(Face {
+                    positions: [get_pos(vi0), get_pos(vi1), get_pos(vi2), get_pos(vi2)],
+                    uvs: [get_uv(ti0), get_uv(ti1), get_uv(ti2), get_uv(ti2)],
+                    colors: [Vec4::ONE; 4],
+                    hidden: false,
+                });
+                i += stride * 3;
+            }
+        }
+
+        if !faces.is_empty() {
+            objects.push((faces, name));
+        }
+        search_from = geo_end;
+    }
+
+    if objects.is_empty() {
+        return Err("No geometry found in DAE file".to_string());
+    }
+    Ok(objects)
+}
+
+/// Shared glTF mesh import logic (used by both GLB and glTF importers).
+fn import_from_gltf_data(
+    meshes: &[GlbMesh],
+    accessors: &[GlbAccessor],
+    buffer_views: &[GlbBufferView],
+    bin: &[u8],
+) -> Result<Vec<(Vec<Face>, Option<String>)>, String> {
+    let mut objects: Vec<(Vec<Face>, Option<String>)> = Vec::new();
+
+    for mesh in meshes {
+        let mut faces = Vec::new();
+
+        if let (Some(pos_acc), Some(idx_acc)) = (mesh.position_accessor, mesh.indices_accessor) {
+            let positions = read_accessor_vec3(accessors, buffer_views, bin, pos_acc);
+            let texcoords = mesh.texcoord_accessor
+                .map(|acc| read_accessor_vec2(accessors, buffer_views, bin, acc))
+                .unwrap_or_default();
+            let indices = read_accessor_indices(accessors, buffer_views, bin, idx_acc);
+
+            let mut i = 0;
+            while i + 2 < indices.len() {
+                let i0 = indices[i] as usize;
+                let i1 = indices[i + 1] as usize;
+                let i2 = indices[i + 2] as usize;
+
+                let get_pos = |idx: usize| positions.get(idx).copied().unwrap_or(Vec3::ZERO);
+                let get_uv = |idx: usize| texcoords.get(idx).copied().unwrap_or(Vec2::ZERO);
+
+                if i + 5 < indices.len() {
+                    let i3 = indices[i + 3] as usize;
+                    let i4 = indices[i + 4] as usize;
+                    let i5 = indices[i + 5] as usize;
+
+                    let n1 = (get_pos(i1) - get_pos(i0)).cross(get_pos(i2) - get_pos(i0));
+                    let n2 = (get_pos(i4) - get_pos(i3)).cross(get_pos(i5) - get_pos(i3));
+                    let coplanar = n1.normalize_or_zero().dot(n2.normalize_or_zero()) > 0.99;
+                    let shared = (i0 == i3 && i2 == i4) || (i0 == i5 && i2 == i3) || (i1 == i3 && i2 == i5);
+
+                    if coplanar && shared {
+                        let quad_verts = if i0 == i3 && i2 == i4 {
+                            [i0, i1, i2, i5]
+                        } else if i0 == i5 && i2 == i3 {
+                            [i0, i1, i2, i4]
+                        } else {
+                            [i0, i1, i5, i2]
+                        };
+                        faces.push(Face {
+                            positions: [get_pos(quad_verts[0]), get_pos(quad_verts[1]), get_pos(quad_verts[2]), get_pos(quad_verts[3])],
+                            uvs: [get_uv(quad_verts[0]), get_uv(quad_verts[1]), get_uv(quad_verts[2]), get_uv(quad_verts[3])],
+                            colors: [Vec4::ONE; 4],
+                            hidden: false,
+                        });
+                        i += 6;
+                        continue;
+                    }
+                }
+
+                faces.push(Face {
+                    positions: [get_pos(i0), get_pos(i1), get_pos(i2), get_pos(i2)],
+                    uvs: [get_uv(i0), get_uv(i1), get_uv(i2), get_uv(i2)],
+                    colors: [Vec4::ONE; 4],
+                    hidden: false,
+                });
+                i += 3;
+            }
+        }
+
+        if !faces.is_empty() {
+            objects.push((faces, mesh.name.clone()));
+        }
+    }
+
+    if objects.is_empty() {
+        return Err("No geometry found in glTF file".to_string());
+    }
+    Ok(objects)
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+fn extract_xml_attr(block: &str, tag: &str, attr: &str) -> Option<String> {
+    let tag_start = block.find(&format!("<{tag}"))?;
+    let tag_end = block[tag_start..].find('>')? + tag_start;
+    let tag_str = &block[tag_start..tag_end];
+    let attr_key = format!("{attr}=\"");
+    let attr_start = tag_str.find(&attr_key)? + attr_key.len();
+    let attr_end = tag_str[attr_start..].find('"')? + attr_start;
+    Some(tag_str[attr_start..attr_end].to_string())
+}
+
+fn parse_dae_float_source(geo_block: &str, source_hint: &str) -> Vec<f32> {
+    // Find <source> whose id contains the hint, then parse its <float_array>
+    let search = format!("-{source_hint}");
+    let Some(src_pos) = geo_block.find(&search) else { return Vec::new() };
+    let Some(fa_start) = geo_block[src_pos..].find("<float_array") else { return Vec::new() };
+    let fa_start = src_pos + fa_start;
+    let Some(data_start) = geo_block[fa_start..].find('>') else { return Vec::new() };
+    let data_start = fa_start + data_start + 1;
+    let Some(data_end) = geo_block[data_start..].find("</float_array>") else { return Vec::new() };
+    let data_end = data_start + data_end;
+    geo_block[data_start..data_end].split_whitespace()
+        .filter_map(|s| s.parse::<f32>().ok())
+        .collect()
+}
+
+fn parse_dae_p_indices(geo_block: &str) -> Vec<u32> {
+    let Some(p_start) = geo_block.find("<p>") else { return Vec::new() };
+    let p_start = p_start + 3;
+    let Some(p_end) = geo_block[p_start..].find("</p>") else { return Vec::new() };
+    let p_end = p_start + p_end;
+    geo_block[p_start..p_end].split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect()
+}
+
+fn count_dae_triangle_inputs(geo_block: &str) -> usize {
+    // Count <input> elements inside <triangles>
+    let Some(tri_start) = geo_block.find("<triangles") else { return 0 };
+    let Some(tri_end) = geo_block[tri_start..].find("</triangles>") else { return 0 };
+    let tri_block = &geo_block[tri_start..tri_start + tri_end];
+    tri_block.matches("<input ").count()
+}

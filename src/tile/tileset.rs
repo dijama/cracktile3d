@@ -1,4 +1,58 @@
 use glam::Vec2;
+use serde::{Serialize, Deserialize};
+
+/// Texture filter mode per tileset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilterMode {
+    #[default]
+    Nearest,
+    Linear,
+}
+
+/// Texture wrap/address mode per tileset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WrapMode {
+    #[default]
+    ClampToEdge,
+    Repeat,
+    MirroredRepeat,
+}
+
+/// Transparency handling mode per tileset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlphaMode {
+    /// Discard pixels below alpha threshold (default).
+    #[default]
+    AlphaTest,
+    /// Full alpha blending.
+    AlphaBlend,
+    /// Fully opaque — ignore alpha channel.
+    Opaque,
+}
+
+/// Per-tileset material settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterialSettings {
+    pub filter: FilterMode,
+    pub wrap: WrapMode,
+    pub alpha_mode: AlphaMode,
+    /// Alpha test threshold (only used when alpha_mode == AlphaTest).
+    pub alpha_cutoff: f32,
+    /// Whether this tileset renders as a decal (overlay with depth bias).
+    pub decal: bool,
+}
+
+impl Default for MaterialSettings {
+    fn default() -> Self {
+        Self {
+            filter: FilterMode::Nearest,
+            wrap: WrapMode::ClampToEdge,
+            alpha_mode: AlphaMode::AlphaTest,
+            alpha_cutoff: 0.01,
+            decal: false,
+        }
+    }
+}
 
 /// A tileset texture divided into a grid of tiles.
 pub struct Tileset {
@@ -13,6 +67,8 @@ pub struct Tileset {
     pub egui_texture_id: Option<egui::TextureId>,
     /// Raw RGBA pixel data, kept for egui registration.
     pub image_data: Option<Vec<u8>>,
+    /// Per-tileset material settings.
+    pub material: MaterialSettings,
 }
 
 impl Tileset {
@@ -146,7 +202,53 @@ impl Tileset {
             bind_group: Some(bind_group),
             egui_texture_id: None,
             image_data: Some(image_data),
+            material: MaterialSettings::default(),
         })
+    }
+
+    /// Rebuild the GPU sampler and bind group after material settings change.
+    pub fn rebuild_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+    ) {
+        let Some(ref texture) = self.gpu_texture else { return };
+        let view = texture.create_view(&Default::default());
+
+        let wgpu_filter = match self.material.filter {
+            FilterMode::Nearest => wgpu::FilterMode::Nearest,
+            FilterMode::Linear => wgpu::FilterMode::Linear,
+        };
+        let wgpu_wrap = match self.material.wrap {
+            WrapMode::ClampToEdge => wgpu::AddressMode::ClampToEdge,
+            WrapMode::Repeat => wgpu::AddressMode::Repeat,
+            WrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
+        };
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu_filter,
+            min_filter: wgpu_filter,
+            mipmap_filter: wgpu_filter,
+            address_mode_u: wgpu_wrap,
+            address_mode_v: wgpu_wrap,
+            address_mode_w: wgpu_wrap,
+            ..Default::default()
+        });
+
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tileset_bg"),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        }));
     }
 
     /// Register this tileset's image with the egui renderer for UI display.

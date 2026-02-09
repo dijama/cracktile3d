@@ -14,6 +14,7 @@ pub enum DrawTool {
     Block,
     Primitive,
     VertexColor,
+    Prefab,
 }
 
 /// Primitive shapes available for the Primitive draw tool.
@@ -24,6 +25,16 @@ pub enum PrimitiveShape {
     Cone,
     Sphere,
     Wedge,
+}
+
+/// Backup of draw state for palette override restoration.
+pub struct PaletteBackup {
+    pub selected_tile: (u32, u32),
+    pub selected_tile_end: (u32, u32),
+    pub tilebrush_rotation: u8,
+    pub tilebrush_flip_h: bool,
+    pub tilebrush_flip_v: bool,
+    pub active_tileset: Option<usize>,
 }
 
 /// Result of a placement computation.
@@ -60,6 +71,10 @@ pub struct DrawState {
     pub tilebrush_flip_h: bool,
     /// Tilebrush vertical flip.
     pub tilebrush_flip_v: bool,
+    /// Whether the tileset panel is floating (true) or docked at bottom (false).
+    pub tileset_panel_floating: bool,
+    /// Block tool subtract mode: when true, block removes overlapping faces instead of adding.
+    pub block_subtract: bool,
 }
 
 impl DrawState {
@@ -77,6 +92,8 @@ impl DrawState {
             tilebrush_rotation: 0,
             tilebrush_flip_h: false,
             tilebrush_flip_v: false,
+            tileset_panel_floating: false,
+            block_subtract: false,
         }
     }
 
@@ -120,7 +137,39 @@ impl DrawState {
             DrawTool::Block => self.compute_block_placement(scene, ray),
             DrawTool::Primitive => self.compute_primitive_placement(scene, ray),
             DrawTool::VertexColor => None, // Handled separately in app.rs
+            DrawTool::Prefab => self.compute_prefab_placement(scene, ray),
         }
+    }
+
+    fn compute_prefab_placement(&self, scene: &Scene, ray: &Ray) -> Option<PlacementResult> {
+        let prefab = scene.active_prefab.and_then(|i| scene.prefabs.get(i))?;
+
+        // Determine placement position: snap to grid at crosshair or hit face
+        let hit = picking::pick_face_culled(ray, scene);
+        let position = if let Some(ref hit) = hit {
+            let offset = hit.normal * scene.grid_cell_size;
+            snap_to_grid(hit.position + offset, scene.grid_cell_size)
+        } else {
+            let grid_normal = self.placement_normal;
+            if let Some(t) = ray.intersect_plane(scene.crosshair_pos, grid_normal) {
+                snap_to_grid(ray.point_at(t), scene.grid_cell_size)
+            } else {
+                scene.crosshair_pos
+            }
+        };
+
+        let faces = prefab.instantiate_at(position);
+        let ts_idx = prefab.tileset_index;
+        let layer_idx = scene.active_layer;
+        let (object_idx, create_object) = find_target_object(scene, layer_idx, ts_idx);
+
+        Some(PlacementResult {
+            layer: layer_idx,
+            object: object_idx,
+            faces,
+            create_object,
+            tileset_index: ts_idx,
+        })
     }
 
     fn compute_tile_placement(&self, scene: &Scene, ray: &Ray) -> Option<PlacementResult> {
@@ -237,6 +286,89 @@ impl DrawState {
 
     /// Get UVs for the currently selected tile region from the active tileset,
     /// with tilebrush rotation/flip applied.
+    /// Apply palette override: pick from active palette and set draw state temporarily.
+    /// Returns the old state to restore after placement.
+    pub fn apply_palette(&mut self, scene: &mut Scene) -> Option<PaletteBackup> {
+        let pal_idx = scene.active_palette?;
+        let palette = scene.palettes.get_mut(pal_idx)?;
+        let (ts_idx, col, row, rotation, flip_h, flip_v) = palette.pick()?;
+
+        let backup = PaletteBackup {
+            selected_tile: self.selected_tile,
+            selected_tile_end: self.selected_tile_end,
+            tilebrush_rotation: self.tilebrush_rotation,
+            tilebrush_flip_h: self.tilebrush_flip_h,
+            tilebrush_flip_v: self.tilebrush_flip_v,
+            active_tileset: scene.active_tileset,
+        };
+
+        self.selected_tile = (col, row);
+        self.selected_tile_end = (col, row);
+        self.tilebrush_rotation = rotation;
+        self.tilebrush_flip_h = flip_h;
+        self.tilebrush_flip_v = flip_v;
+        scene.active_tileset = Some(ts_idx);
+
+        Some(backup)
+    }
+
+    /// Restore draw state after palette placement.
+    pub fn restore_palette(&mut self, scene: &mut Scene, backup: PaletteBackup) {
+        self.selected_tile = backup.selected_tile;
+        self.selected_tile_end = backup.selected_tile_end;
+        self.tilebrush_rotation = backup.tilebrush_rotation;
+        self.tilebrush_flip_h = backup.tilebrush_flip_h;
+        self.tilebrush_flip_v = backup.tilebrush_flip_v;
+        scene.active_tileset = backup.active_tileset;
+    }
+
+    /// Compute all tile faces for a rectangular fill between two grid positions.
+    /// `start` and `end` are grid-snapped centers on the placement plane.
+    /// `normal` is the face normal for all placed tiles.
+    pub fn compute_rect_fill(&self, scene: &Scene, start: Vec3, end: Vec3, normal: Vec3) -> Vec<Face> {
+        let cell = scene.grid_cell_size;
+        let half = cell * 0.5;
+        let uvs = self.tile_uvs(scene);
+        let (tile_cols, tile_rows) = self.tile_selection_size();
+        let step_x = cell * tile_cols as f32;
+        let step_y = cell * tile_rows as f32;
+
+        // Compute tangent basis for the normal
+        let n = normal.normalize();
+        let reference = if n.y.abs() > 0.9 { Vec3::Z } else { Vec3::Y };
+        let right = reference.cross(n).normalize();
+        let up = n.cross(right).normalize();
+
+        // Project start and end onto the tangent plane
+        let d = end - start;
+        let du = d.dot(right);
+        let dv = d.dot(up);
+
+        // Number of tiles in each direction
+        let count_u = ((du.abs() / step_x).round() as i32).max(0) + 1;
+        let count_v = ((dv.abs() / step_y).round() as i32).max(0) + 1;
+
+        let sign_u = if du >= 0.0 { 1.0 } else { -1.0 };
+        let sign_v = if dv >= 0.0 { 1.0 } else { -1.0 };
+
+        let mut faces = Vec::with_capacity((count_u * count_v) as usize);
+        for iv in 0..count_v {
+            for iu in 0..count_u {
+                let center = start + right * (iu as f32 * step_x * sign_u) + up * (iv as f32 * step_y * sign_v);
+                let face = if tile_cols == 1 && tile_rows == 1 {
+                    Face::new_quad(center, normal, half, uvs)
+                } else {
+                    let half_w = cell * tile_cols as f32 * 0.5;
+                    let half_h = cell * tile_rows as f32 * 0.5;
+                    Face::new_rect_quad(center, normal, half_w, half_h, uvs)
+                };
+                faces.push(face);
+            }
+        }
+
+        faces
+    }
+
     pub fn tile_uvs(&self, scene: &Scene) -> [Vec2; 4] {
         let base_uvs = if let Some(active_idx) = scene.active_tileset
             && let Some(tileset) = scene.tilesets.get(active_idx)
