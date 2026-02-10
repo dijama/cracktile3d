@@ -12,6 +12,9 @@ use crate::tools::edit::Selection;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Maximum number of model matrix slots in the dynamic uniform buffer.
+const MAX_MODEL_SLOTS: u64 = 512;
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -50,6 +53,14 @@ pub struct Renderer {
     pub light_intensity: f32,
     /// Ambient light color RGB.
     pub ambient_color: [f32; 3],
+
+    // Model matrix dynamic uniform buffer (for instances)
+    model_buffer: wgpu::Buffer,
+    model_bind_group: wgpu::BindGroup,
+    /// Alignment requirement for dynamic offsets into the model buffer.
+    model_buffer_alignment: u32,
+    /// Number of model matrix slots used this frame (reset in prepare_frame).
+    model_slot_count: u32,
 }
 
 impl Renderer {
@@ -192,7 +203,46 @@ impl Renderer {
             }],
         });
 
-        // Tile pipeline
+        // Model matrix dynamic uniform buffer
+        let model_buffer_alignment = device.limits().min_uniform_buffer_offset_alignment;
+        let model_buffer_size = model_buffer_alignment as u64 * MAX_MODEL_SLOTS;
+
+        let model_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model_uniform"),
+            size: model_buffer_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let model_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("model_bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(64), // mat4x4<f32>
+                    },
+                    count: None,
+                }],
+            });
+
+        let model_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("model_bg"),
+            layout: &model_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &model_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(64), // mat4x4<f32>
+                }),
+            }],
+        });
+
+        // Tile pipeline — bind groups: [camera, tileset, light, model]
         let tile_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/tile.wgsl").into()),
@@ -200,7 +250,7 @@ impl Renderer {
 
         let tile_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile_pipeline_layout"),
-            bind_group_layouts: &[&camera_bind_group_layout, &tile_bind_group_layout, &light_bind_group_layout],
+            bind_group_layouts: &[&camera_bind_group_layout, &tile_bind_group_layout, &light_bind_group_layout, &model_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -276,7 +326,7 @@ impl Renderer {
             cache: None,
         });
 
-        // Line pipeline
+        // Line pipeline — bind groups: [camera, model]
         let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("line_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/line.wgsl").into()),
@@ -284,7 +334,7 @@ impl Renderer {
 
         let line_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("line_pipeline_layout"),
-            bind_group_layouts: &[&camera_bind_group_layout],
+            bind_group_layouts: &[&camera_bind_group_layout, &model_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -429,6 +479,10 @@ impl Renderer {
             light_color: [1.0, 1.0, 0.95],
             light_intensity: 0.8,
             ambient_color: [0.3, 0.3, 0.35],
+            model_buffer,
+            model_bind_group,
+            model_buffer_alignment,
+            model_slot_count: 0,
         }
     }
 
@@ -443,7 +497,17 @@ impl Renderer {
         self.camera.set_aspect(width as f32, height as f32);
     }
 
-    /// Upload per-frame data (camera, grid, skybox, lighting) before the render pass begins.
+    /// Allocate a model matrix slot and upload the matrix. Returns the dynamic offset.
+    fn upload_model_matrix(&mut self, matrix: glam::Mat4) -> u32 {
+        let slot = self.model_slot_count;
+        self.model_slot_count += 1;
+        let offset = slot * self.model_buffer_alignment;
+        let data: [f32; 16] = matrix.to_cols_array();
+        self.queue.write_buffer(&self.model_buffer, offset as u64, bytemuck::cast_slice(&data));
+        offset
+    }
+
+    /// Upload per-frame data (camera, grid, skybox, lighting, model identity) before the render pass begins.
     pub fn prepare_frame(&mut self, scene: &Scene) {
         let vp = self.camera.view_projection();
         let vp_raw: [f32; 16] = vp.to_cols_array();
@@ -464,6 +528,27 @@ impl Renderer {
             self.ambient_color[0], self.ambient_color[1], self.ambient_color[2], 0.0,
         ];
         self.queue.write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&light_data));
+
+        // Reset model slot counter and upload identity matrix at slot 0
+        self.model_slot_count = 0;
+        self.upload_model_matrix(glam::Mat4::IDENTITY);
+
+        // Upload instance model matrices
+        for layer in &scene.layers {
+            if !layer.visible { continue; }
+            for object in &layer.objects {
+                for inst in &object.instances {
+                    if self.model_slot_count < MAX_MODEL_SLOTS as u32 {
+                        self.upload_model_matrix(inst.model_matrix());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the dynamic offset for the identity model matrix (slot 0).
+    fn identity_offset(&self) -> u32 {
+        0
     }
 
     pub fn render_scene<'a>(
@@ -476,9 +561,10 @@ impl Renderer {
         // Draw skybox behind everything
         self.skybox.render(pass);
 
-        // Draw grid
+        // Draw grid (uses line pipeline with identity model)
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, self.grid.vertex_buffer.slice(..));
         pass.draw(0..self.grid.vertex_count, 0..1);
 
@@ -500,6 +586,10 @@ impl Renderer {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.light_bind_group, &[]);
+            pass.set_bind_group(3, &self.model_bind_group, &[self.identity_offset()]);
+
+            // Track model slot index for instances (slot 0 = identity, then instances)
+            let mut inst_slot: u32 = 1;
 
             for layer in &scene.layers {
                 if !layer.visible {
@@ -514,7 +604,23 @@ impl Renderer {
                         pass.set_bind_group(1, bind_group, &[]);
                         pass.set_vertex_buffer(0, gpu_mesh.vertex_buffer.slice(..));
                         pass.set_index_buffer(gpu_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+                        // Draw source object with identity model
+                        pass.set_bind_group(3, &self.model_bind_group, &[self.identity_offset()]);
                         pass.draw_indexed(0..gpu_mesh.index_count, 0, 0..1);
+
+                        // Draw instances with their model matrices
+                        for _inst in &object.instances {
+                            if inst_slot < MAX_MODEL_SLOTS as u32 {
+                                let offset = inst_slot * self.model_buffer_alignment;
+                                pass.set_bind_group(3, &self.model_bind_group, &[offset]);
+                                pass.draw_indexed(0..gpu_mesh.index_count, 0, 0..1);
+                            }
+                            inst_slot += 1;
+                        }
+                    } else {
+                        // Skip instance slots even if no gpu_mesh
+                        inst_slot += object.instances.len() as u32;
                     }
                 }
             }
@@ -531,6 +637,7 @@ impl Renderer {
                 continue;
             }
             for object in &layer.objects {
+                // Source object faces
                 for face in &object.faces {
                     let p = &face.positions;
                     for i in 0..4 {
@@ -538,6 +645,19 @@ impl Renderer {
                         let b = p[(i + 1) % 4];
                         line_verts.push(LineVertex { position: a.into(), color });
                         line_verts.push(LineVertex { position: b.into(), color });
+                    }
+                }
+                // Instance faces (CPU-transformed)
+                for inst in &object.instances {
+                    let m = inst.model_matrix();
+                    for face in &object.faces {
+                        let p = &face.positions;
+                        for i in 0..4 {
+                            let a = m.transform_point3(p[i]);
+                            let b = m.transform_point3(p[(i + 1) % 4]);
+                            line_verts.push(LineVertex { position: a.into(), color });
+                            line_verts.push(LineVertex { position: b.into(), color });
+                        }
                     }
                 }
             }
@@ -555,6 +675,7 @@ impl Renderer {
 
         pass.set_pipeline(&self.line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..line_verts.len() as u32, 0..1);
     }
@@ -605,6 +726,24 @@ impl Renderer {
             }
         }
 
+        // Instance-level selection: outline all faces transformed by instance matrix
+        for &(li, oi, ii) in &selection.instances {
+            if let Some(object) = scene.layers.get(li).and_then(|l| l.objects.get(oi)) {
+                if let Some(inst) = object.instances.get(ii) {
+                    let m = inst.model_matrix();
+                    for face in &object.faces {
+                        let p = &face.positions;
+                        for i in 0..4 {
+                            let a = m.transform_point3(p[i]);
+                            let b = m.transform_point3(p[(i + 1) % 4]);
+                            line_verts.push(LineVertex { position: a.into(), color: highlight_color });
+                            line_verts.push(LineVertex { position: b.into(), color: highlight_color });
+                        }
+                    }
+                }
+            }
+        }
+
         // Edge-level selection: draw highlighted edges
         let edge_color = [1.0, 0.6, 0.2, 1.0]; // Orange
         for &(li, oi, fi, ei) in &selection.edges {
@@ -648,6 +787,7 @@ impl Renderer {
 
         pass.set_pipeline(&self.selection_line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..line_verts.len() as u32, 0..1);
     }
@@ -684,6 +824,7 @@ impl Renderer {
 
         pass.set_pipeline(&self.selection_line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..line_verts.len() as u32, 0..1);
     }
@@ -719,6 +860,7 @@ impl Renderer {
 
         pass.set_pipeline(&self.selection_line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..line_verts.len() as u32, 0..1);
     }
@@ -741,6 +883,7 @@ impl Renderer {
 
         pass.set_pipeline(&self.selection_line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..gizmo_verts.len() as u32, 0..1);
     }
@@ -792,6 +935,7 @@ impl Renderer {
 
         pass.set_pipeline(&self.selection_line_pipeline);
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.model_bind_group, &[self.identity_offset()]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         pass.draw(0..verts.len() as u32, 0..1);
     }

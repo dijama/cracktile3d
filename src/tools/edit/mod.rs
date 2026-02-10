@@ -31,6 +31,8 @@ pub struct Selection {
     pub vertices: Vec<(usize, usize, usize, usize)>,
     /// (layer_index, object_index, face_index, edge_index) for edge selection
     pub edges: Vec<(usize, usize, usize, usize)>,
+    /// (layer_index, object_index, instance_index) for instance selection
+    pub instances: Vec<(usize, usize, usize)>,
 }
 
 impl Selection {
@@ -39,10 +41,12 @@ impl Selection {
         self.faces.clear();
         self.vertices.clear();
         self.edges.clear();
+        self.instances.clear();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.objects.is_empty() && self.faces.is_empty() && self.vertices.is_empty() && self.edges.is_empty()
+        self.objects.is_empty() && self.faces.is_empty() && self.vertices.is_empty()
+            && self.edges.is_empty() && self.instances.is_empty()
     }
 
     /// Compute the centroid of all selected geometry.
@@ -80,6 +84,17 @@ impl Selection {
                 .map(|f| f.positions[vi])
             {
                 sum += pos;
+                count += 1;
+            }
+        }
+
+        // Instance-level selection: use instance position as centroid
+        for &(li, oi, ii) in &self.instances {
+            if let Some(inst) = scene.layers.get(li)
+                .and_then(|l| l.objects.get(oi))
+                .and_then(|o| o.instances.get(ii))
+            {
+                sum += inst.position;
                 count += 1;
             }
         }
@@ -151,6 +166,7 @@ impl EditState {
             for (oi, object) in layer.objects.iter().enumerate() {
                 match self.selection_level {
                     SelectionLevel::Object => {
+                        // Source object
                         let mut any_inside = false;
                         'obj_check: for face in &object.faces {
                             for &pos in &face.positions {
@@ -166,6 +182,28 @@ impl EditState {
                             let entry = (li, oi);
                             if !self.selection.objects.contains(&entry) {
                                 self.selection.objects.push(entry);
+                            }
+                        }
+                        // Instances
+                        for (ii, inst) in object.instances.iter().enumerate() {
+                            let m = inst.model_matrix();
+                            let mut inst_inside = false;
+                            'inst_check: for face in &object.faces {
+                                for &pos in &face.positions {
+                                    let wp = m.transform_point3(pos);
+                                    if let Some(sp) = project_to_screen(wp, view_proj, screen_size)
+                                        && sp.x >= min_x && sp.x <= max_x && sp.y >= min_y && sp.y <= max_y
+                                    {
+                                        inst_inside = true;
+                                        break 'inst_check;
+                                    }
+                                }
+                            }
+                            if inst_inside {
+                                let entry = (li, oi, ii);
+                                if !self.selection.instances.contains(&entry) {
+                                    self.selection.instances.push(entry);
+                                }
                             }
                         }
                     }
@@ -229,6 +267,9 @@ impl EditState {
                 match self.selection_level {
                     SelectionLevel::Object => {
                         self.selection.objects.push((li, oi));
+                        for ii in 0..object.instances.len() {
+                            self.selection.instances.push((li, oi, ii));
+                        }
                     }
                     SelectionLevel::Face => {
                         for fi in 0..object.faces.len() {
@@ -258,15 +299,21 @@ impl EditState {
     pub fn invert_selection(&mut self, scene: &Scene) {
         match self.selection_level {
             SelectionLevel::Object => {
-                let mut all = Vec::new();
+                let mut all_objs = Vec::new();
+                let mut all_insts = Vec::new();
                 for (li, layer) in scene.layers.iter().enumerate() {
                     if !layer.visible { continue; }
-                    for oi in 0..layer.objects.len() {
-                        all.push((li, oi));
+                    for (oi, object) in layer.objects.iter().enumerate() {
+                        all_objs.push((li, oi));
+                        for ii in 0..object.instances.len() {
+                            all_insts.push((li, oi, ii));
+                        }
                     }
                 }
-                let old = std::mem::take(&mut self.selection.objects);
-                self.selection.objects = all.into_iter().filter(|e| !old.contains(e)).collect();
+                let old_objs = std::mem::take(&mut self.selection.objects);
+                let old_insts = std::mem::take(&mut self.selection.instances);
+                self.selection.objects = all_objs.into_iter().filter(|e| !old_objs.contains(e)).collect();
+                self.selection.instances = all_insts.into_iter().filter(|e| !old_insts.contains(e)).collect();
             }
             SelectionLevel::Face => {
                 let mut all = Vec::new();
@@ -552,12 +599,21 @@ impl EditState {
         if let Some(hit) = hit {
             match self.selection_level {
                 SelectionLevel::Object => {
-                    let entry = (hit.layer_index, hit.object_index);
-                    if !self.selection.objects.contains(&entry) {
-                        self.selection.objects.push(entry);
+                    if let Some(ii) = hit.instance_index {
+                        // Clicked on an instance — select at instance level
+                        let entry = (hit.layer_index, hit.object_index, ii);
+                        if !self.selection.instances.contains(&entry) {
+                            self.selection.instances.push(entry);
+                        }
+                    } else {
+                        let entry = (hit.layer_index, hit.object_index);
+                        if !self.selection.objects.contains(&entry) {
+                            self.selection.objects.push(entry);
+                        }
                     }
                 }
                 SelectionLevel::Face => {
+                    // For face/vertex/edge on instances, select the source object's face
                     let entry = (hit.layer_index, hit.object_index, hit.face_index);
                     if !self.selection.faces.contains(&entry) {
                         self.selection.faces.push(entry);

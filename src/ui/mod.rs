@@ -92,6 +92,10 @@ pub enum UiAction {
     // Bone operations
     AddBone,
     DeleteBone(usize),
+    // Instance operations
+    CreateInstance,
+    DeconstructInstance,
+    DeleteInstance,
     // Skybox
     ToggleSkybox,
     LoadSkyboxImage,
@@ -317,6 +321,15 @@ pub fn draw_ui(
                         ui.close();
                     }
                 });
+                ui.separator();
+                if ui.button("Create Instance  Ctrl+Shift+I").clicked() {
+                    action = UiAction::CreateInstance;
+                    ui.close();
+                }
+                if ui.button("Deconstruct Instance").clicked() {
+                    action = UiAction::DeconstructInstance;
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Keybindings...").clicked() {
                     action = UiAction::OpenKeybindingsEditor;
@@ -563,9 +576,15 @@ pub fn draw_ui(
                 .map(|o| o.faces.len())
                 .sum();
             ui.label(format!("Faces: {total_faces}"));
+            let (inst_total, _) = scene.instance_count();
+            if inst_total > 0 {
+                ui.separator();
+                ui.label(format!("Instances: {inst_total}"));
+            }
             ui.separator();
             let sel = &edit_state.selection;
-            let sel_count = sel.faces.len() + sel.objects.len() + sel.vertices.len() + sel.edges.len();
+            let sel_count = sel.faces.len() + sel.objects.len() + sel.vertices.len()
+                + sel.edges.len() + sel.instances.len();
             if sel_count > 0 {
                 ui.label(format!("Selected: {sel_count}"));
                 ui.separator();

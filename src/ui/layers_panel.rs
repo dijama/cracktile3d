@@ -72,7 +72,13 @@ pub fn draw_layers_panel(
 
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
-                                let resp = ui.selectable_label(is_selected, format!("{obj_name} ({obj_faces}f)"));
+                                let inst_count = scene.layers[i].objects[oi].instances.len();
+                                let label = if inst_count > 0 {
+                                    format!("{obj_name} ({obj_faces}f, {inst_count}i)")
+                                } else {
+                                    format!("{obj_name} ({obj_faces}f)")
+                                };
+                                let resp = ui.selectable_label(is_selected, label);
                                 if resp.clicked() {
                                     if !ui.input(|inp| inp.modifiers.shift) {
                                         edit_state.selection.clear();
@@ -92,6 +98,49 @@ pub fn draw_layers_panel(
                                     });
                                 });
                             });
+
+                            // Show instances under each object
+                            let num_instances = scene.layers[i].objects[oi].instances.len();
+                            if num_instances > 0 {
+                                for ii in 0..num_instances {
+                                    let inst_name = scene.layers[i].objects[oi].instances[ii].name.clone();
+                                    let is_inst_selected = edit_state.selection.instances.contains(&(i, oi, ii));
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(32.0);
+                                        let resp = ui.selectable_label(is_inst_selected, format!("-> {inst_name}"));
+                                        if resp.clicked() {
+                                            if !ui.input(|inp| inp.modifiers.shift) {
+                                                edit_state.selection.clear();
+                                            }
+                                            if is_inst_selected {
+                                                edit_state.selection.instances.retain(|&(li, o, inst)| li != i || o != oi || inst != ii);
+                                            } else {
+                                                edit_state.selection.instances.push((i, oi, ii));
+                                            }
+                                        }
+
+                                        // Instance context menu
+                                        resp.context_menu(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Name:");
+                                                ui.text_edit_singleline(&mut scene.layers[i].objects[oi].instances[ii].name);
+                                            });
+                                            ui.separator();
+                                            if ui.button("Deconstruct").clicked() {
+                                                // Select this instance for deconstruct
+                                                edit_state.selection.clear();
+                                                edit_state.selection.instances.push((i, oi, ii));
+                                                ui.close();
+                                            }
+                                            if ui.button("Delete").clicked() {
+                                                edit_state.selection.clear();
+                                                edit_state.selection.instances.push((i, oi, ii));
+                                                ui.close();
+                                            }
+                                        });
+                                    });
+                                }
+                            }
                         }
                     });
             }

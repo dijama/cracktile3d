@@ -8,10 +8,15 @@ struct LightUniform {
     ambient: vec4<f32>,     // rgb = ambient color, a = unused
 };
 
+struct ModelUniform {
+    model: mat4x4<f32>,
+};
+
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(1) @binding(0) var t_tileset: texture_2d<f32>;
 @group(1) @binding(1) var s_tileset: sampler;
 @group(2) @binding(0) var<uniform> light: LightUniform;
+@group(3) @binding(0) var<uniform> model: ModelUniform;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -27,13 +32,26 @@ struct VertexOutput {
     @location(2) normal: vec3<f32>,
 };
 
+// Compute the cofactor (adjugate) of a 3x3 matrix — transpose of this is the
+// inverse-transpose needed for correct normal transformation under non-uniform scale.
+fn cofactor3(m: mat3x3<f32>) -> mat3x3<f32> {
+    let c0 = cross(m[1], m[2]);
+    let c1 = cross(m[2], m[0]);
+    let c2 = cross(m[0], m[1]);
+    return mat3x3<f32>(c0, c1, c2);
+}
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = camera.view_proj * vec4<f32>(in.position, 1.0);
+    let world_pos = model.model * vec4<f32>(in.position, 1.0);
+    out.clip_position = camera.view_proj * world_pos;
     out.uv = in.uv;
     out.color = in.color;
-    out.normal = in.normal;
+    // Normal matrix = cofactor of upper-left 3x3 (equivalent to transpose(inverse(M)) * det(M))
+    // The determinant factor cancels after normalize(), so cofactor alone is sufficient.
+    let model3 = mat3x3<f32>(model.model[0].xyz, model.model[1].xyz, model.model[2].xyz);
+    out.normal = normalize(cofactor3(model3) * in.normal);
     return out;
 }
 

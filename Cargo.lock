@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "cracktile3d"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "bincode",
  "bytemuck",

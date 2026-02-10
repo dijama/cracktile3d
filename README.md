@@ -30,6 +30,7 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 - **Geometry** — Mirror X/Y/Z across crosshair plane
 - **Edge operations** — Split edge (quad to 2 quads), collapse edge (merge to midpoint)
 - **Advanced selection** — Select by normal, overlapping, tilebrush, edge loop, faces from vertices
+- **Instances** — Create lightweight copies (Ctrl+Shift+I) that share source geometry with independent transforms; deconstruct back to independent objects
 - **Selection tools** — Click, shift-click, marquee drag, select all, invert, select connected
 - **Copy/paste** — Ctrl+C/V with crosshair-relative placement
 - **Hide/show** — H to hide selected, Shift+H to show all (undoable)
@@ -52,8 +53,9 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 
 ### File I/O
 - Native binary format (.ct3d) with save/load
-- Import from Wavefront OBJ (.obj) and glTF Binary (.glb)
-- Export to Wavefront OBJ (.obj) and glTF Binary (.glb)
+- Import from Wavefront OBJ (.obj), glTF Binary (.glb), and COLLADA (.dae)
+- Export to Wavefront OBJ (.obj), glTF Binary (.glb), glTF (.gltf), and COLLADA (.dae)
+- Instances flattened to independent geometry on export
 - Screenshot to PNG (F12)
 - Recent files menu (remembers last 10 files)
 
@@ -66,7 +68,7 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 - Floating tileset panel (pop-out/dock with Ctrl+Shift+T)
 - Floating UV editor panel (Ctrl+U)
 - Clickable edit operation buttons (UV, geometry, edge ops)
-- Object tree in layers panel
+- Object + instance tree in layers panel
 - Editable vertex positions, UVs, and colors in properties panel (with undo support)
 - Elevated grid at crosshair height
 - Unsaved changes indicator
@@ -139,6 +141,7 @@ Inspired by [Crocotile 3D](https://crocotile3d.com/), rebuilt from first princip
 | Ctrl+C / Ctrl+V | Copy / Paste |
 | Alt+D | Subdivide faces |
 | Enter | Create object from selection |
+| Ctrl+Shift+I | Create instance from selected object |
 | T / R / Y | Gizmo: Translate / Rotate / Scale |
 | 1 / 2 / 3 / 4 | Selection: Object / Face / Edge / Vertex |
 | Ctrl+Shift+1-5 | Save camera bookmark |
@@ -191,7 +194,7 @@ src/
 │   └── shaders/         # WGSL shaders (tile, line, skybox)
 ├── scene/
 │   ├── mod.rs           # Scene, Layer structs
-│   ├── object.rs        # Object with GPU mesh batching
+│   ├── object.rs        # Object with GPU mesh batching + instances
 │   └── mesh.rs          # Face (quad) geometry, tangent_basis, flatten_uvs
 ├── tools/
 │   ├── draw/            # Draw tools, placement, tilebrush, primitives
@@ -205,9 +208,9 @@ src/
 │   ├── uv_panel.rs      # Floating UV editor
 │   ├── viewcube.rs      # 3D orientation cube overlay
 │   └── rulers.rs        # Viewport rulers with coordinate labels
-├── history/             # Undo/redo command pattern (30+ command types)
+├── history/             # Undo/redo command pattern (35+ command types)
 ├── tile/                # Tileset loading, UV computation
-├── io/                  # Save/load (.ct3d), import/export (OBJ, GLB)
+├── io/                  # Save/load (.ct3d), import/export (OBJ, GLB, glTF, DAE)
 ├── keybindings.rs       # Customizable keybinding system
 ├── settings.rs          # Persistent user preferences
 └── util/                # Raycasting, picking, screen projection

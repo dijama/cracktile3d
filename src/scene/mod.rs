@@ -1,7 +1,7 @@
 mod object;
 pub mod mesh;
 
-pub use object::Object;
+pub use object::{Object, Instance};
 use glam::Vec3;
 use serde::{Serialize, Deserialize};
 use crate::tile::Tileset;
@@ -93,6 +93,21 @@ pub struct Layer {
 }
 
 impl Scene {
+    /// Count total instances and objects that have instances.
+    pub fn instance_count(&self) -> (usize, usize) {
+        let mut total = 0;
+        let mut objects_with = 0;
+        for layer in &self.layers {
+            for obj in &layer.objects {
+                if !obj.instances.is_empty() {
+                    total += obj.instances.len();
+                    objects_with += 1;
+                }
+            }
+        }
+        (total, objects_with)
+    }
+
     pub fn new() -> Self {
         Self {
             layers: vec![Layer {

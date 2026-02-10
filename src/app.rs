@@ -393,6 +393,11 @@ impl App {
             };
         }
 
+        // Create Instance keybinding (Ctrl+Shift+I)
+        if self.keybindings.is_triggered(crate::keybindings::Action::CreateInstance, &self.input) {
+            self.pending_action = Some(UiAction::CreateInstance);
+        }
+
         // Number keys switch draw tools
         if self.tool_mode == ToolMode::Draw && !self.input.space_held() {
             if self.keybindings.is_triggered(crate::keybindings::Action::ToolTile, &self.input) { self.draw_state.tool = DrawTool::Tile; }
@@ -780,10 +785,28 @@ impl App {
                     self.edit_state.gizmo_drag = Some(drag);
                 } else {
                     // Mouse released — undo live preview, push command
+                    // First, capture instance old transforms (post live-preview, about to be undone)
+                    let has_instances = !self.edit_state.selection.instances.is_empty();
+
                     match self.edit_state.gizmo_mode {
                         GizmoMode::Translate => {
                             if drag.applied_delta.length_squared() > 1e-6 {
                                 Self::apply_translate_live(&self.edit_state.selection, &mut self.scene, -drag.applied_delta, &gpu.renderer.device);
+                                // After undo, current state = pre-drag. Capture old_transforms.
+                                if has_instances {
+                                    let targets = self.edit_state.selection.instances.clone();
+                                    let old_transforms: Vec<_> = targets.iter().filter_map(|&(li, oi, ii)| {
+                                        self.scene.layers.get(li)
+                                            .and_then(|l| l.objects.get(oi))
+                                            .and_then(|o| o.instances.get(ii))
+                                            .map(|inst| (inst.position, inst.rotation, inst.scale))
+                                    }).collect();
+                                    let new_transforms: Vec<_> = old_transforms.iter().map(|&(pos, rot, scl)| {
+                                        (pos + drag.applied_delta, rot, scl)
+                                    }).collect();
+                                    let cmd = commands::TransformInstance { targets, old_transforms, new_transforms };
+                                    self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                                }
                                 let cmd = commands::TranslateSelection {
                                     faces: self.edit_state.selection.faces.clone(),
                                     objects: self.edit_state.selection.objects.clone(),
@@ -796,6 +819,21 @@ impl App {
                         GizmoMode::Rotate => {
                             if drag.applied_angle.abs() > 1e-5 {
                                 Self::apply_rotate_live(&self.edit_state.selection, &mut self.scene, drag.axis.direction(), -drag.applied_angle, drag.origin, &gpu.renderer.device);
+                                if has_instances {
+                                    let quat = glam::Quat::from_axis_angle(drag.axis.direction(), drag.applied_angle);
+                                    let targets = self.edit_state.selection.instances.clone();
+                                    let old_transforms: Vec<_> = targets.iter().filter_map(|&(li, oi, ii)| {
+                                        self.scene.layers.get(li)
+                                            .and_then(|l| l.objects.get(oi))
+                                            .and_then(|o| o.instances.get(ii))
+                                            .map(|inst| (inst.position, inst.rotation, inst.scale))
+                                    }).collect();
+                                    let new_transforms: Vec<_> = old_transforms.iter().map(|&(pos, rot, scl)| {
+                                        (quat * (pos - drag.origin) + drag.origin, quat * rot, scl)
+                                    }).collect();
+                                    let cmd = commands::TransformInstance { targets, old_transforms, new_transforms };
+                                    self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                                }
                                 let cmd = commands::RotateSelection {
                                     faces: self.edit_state.selection.faces.clone(),
                                     objects: self.edit_state.selection.objects.clone(),
@@ -815,6 +853,20 @@ impl App {
                                     1.0 / drag.applied_scale.z,
                                 );
                                 Self::apply_scale_live(&self.edit_state.selection, &mut self.scene, undo_scale, drag.origin, &gpu.renderer.device);
+                                if has_instances {
+                                    let targets = self.edit_state.selection.instances.clone();
+                                    let old_transforms: Vec<_> = targets.iter().filter_map(|&(li, oi, ii)| {
+                                        self.scene.layers.get(li)
+                                            .and_then(|l| l.objects.get(oi))
+                                            .and_then(|o| o.instances.get(ii))
+                                            .map(|inst| (inst.position, inst.rotation, inst.scale))
+                                    }).collect();
+                                    let new_transforms: Vec<_> = old_transforms.iter().map(|&(pos, rot, scl)| {
+                                        (drag.origin + (pos - drag.origin) * drag.applied_scale, rot, scl * drag.applied_scale)
+                                    }).collect();
+                                    let cmd = commands::TransformInstance { targets, old_transforms, new_transforms };
+                                    self.history.push(Box::new(cmd), &mut self.scene, &gpu.renderer.device);
+                                }
                                 let cmd = commands::ScaleSelection {
                                     faces: self.edit_state.selection.faces.clone(),
                                     objects: self.edit_state.selection.objects.clone(),
@@ -2459,6 +2511,47 @@ impl App {
                 // Placeholder — currently prefabs are placed as normal faces
                 // so deconstruction is the default behavior
             }
+            UiAction::CreateInstance => {
+                // Create an instance from selected objects
+                if !self.edit_state.selection.objects.is_empty() {
+                    for &(li, oi) in &self.edit_state.selection.objects.clone() {
+                        let inst = crate::scene::Instance {
+                            name: format!("{} (inst)", self.scene.layers[li].objects[oi].name),
+                            position: glam::Vec3::new(1.0, 0.0, 0.0),
+                            ..Default::default()
+                        };
+                        self.history.push(Box::new(crate::history::commands::CreateInstance {
+                            layer: li, object: oi, instance: inst,
+                        }), &mut self.scene, &gpu.renderer.device);
+                    }
+                    self.has_unsaved_changes = true;
+                }
+            }
+            UiAction::DeleteInstance => {
+                // Delete selected instances
+                let mut targets: Vec<(usize, usize, usize)> = self.edit_state.selection.instances.clone();
+                // Sort in reverse to avoid index shifting
+                targets.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)).then_with(|| b.0.cmp(&a.0)));
+                for (li, oi, ii) in targets {
+                    self.history.push(Box::new(crate::history::commands::DeleteInstance {
+                        layer: li, object: oi, instance_index: ii, stored: None,
+                    }), &mut self.scene, &gpu.renderer.device);
+                }
+                self.edit_state.selection.instances.clear();
+                self.has_unsaved_changes = true;
+            }
+            UiAction::DeconstructInstance => {
+                // Deconstruct selected instances into independent objects
+                let mut targets: Vec<(usize, usize, usize)> = self.edit_state.selection.instances.clone();
+                targets.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)).then_with(|| b.0.cmp(&a.0)));
+                for (li, oi, ii) in targets {
+                    self.history.push(Box::new(
+                        crate::history::commands::DeconstructInstance::new(li, oi, ii)
+                    ), &mut self.scene, &gpu.renderer.device);
+                }
+                self.edit_state.selection.instances.clear();
+                self.has_unsaved_changes = true;
+            }
             UiAction::RenamePrefab(idx, ref new_name) => {
                 if let Some(prefab) = self.scene.prefabs.get_mut(idx) {
                     prefab.name = new_name.clone();
@@ -3149,7 +3242,7 @@ impl App {
         selection: &crate::tools::edit::Selection,
         scene: &mut Scene,
         delta: glam::Vec3,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
     ) {
         let mut rebuild = std::collections::HashSet::new();
         for &(li, oi, fi) in &selection.faces {
@@ -3170,8 +3263,17 @@ impl App {
             scene.layers[li].objects[oi].faces[fi].positions[vi] += delta;
             rebuild.insert((li, oi));
         }
+        // Instance transforms: translate instance position (no GPU mesh rebuild needed)
+        for &(li, oi, ii) in &selection.instances {
+            if let Some(inst) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.instances.get_mut(ii))
+            {
+                inst.position += delta;
+            }
+        }
         for (li, oi) in rebuild {
-            scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
+            scene.layers[li].objects[oi].rebuild_gpu_mesh(_device);
         }
     }
 
@@ -3205,6 +3307,16 @@ impl App {
             *pos = quat * (*pos - center) + center;
             rebuild.insert((li, oi));
         }
+        // Instance transforms: rotate position around center and accumulate rotation
+        for &(li, oi, ii) in &selection.instances {
+            if let Some(inst) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.instances.get_mut(ii))
+            {
+                inst.position = quat * (inst.position - center) + center;
+                inst.rotation = quat * inst.rotation;
+            }
+        }
         for (li, oi) in rebuild {
             scene.layers[li].objects[oi].rebuild_gpu_mesh(device);
         }
@@ -3237,6 +3349,16 @@ impl App {
             let pos = &mut scene.layers[li].objects[oi].faces[fi].positions[vi];
             *pos = center + (*pos - center) * factor;
             rebuild.insert((li, oi));
+        }
+        // Instance transforms: scale position relative to center and accumulate scale
+        for &(li, oi, ii) in &selection.instances {
+            if let Some(inst) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.instances.get_mut(ii))
+            {
+                inst.position = center + (inst.position - center) * factor;
+                inst.scale *= factor;
+            }
         }
         for (li, oi) in rebuild {
             scene.layers[li].objects[oi].rebuild_gpu_mesh(device);

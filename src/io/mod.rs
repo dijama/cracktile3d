@@ -72,6 +72,25 @@ pub fn export_obj(scene: &Scene, path: &Path) -> Result<(), String> {
             if !face_refs.is_empty() {
                 objects.push((object.name.clone(), face_refs));
             }
+
+            // Flatten instances
+            for inst in &object.instances {
+                let m = inst.model_matrix();
+                let mut inst_refs = Vec::new();
+                for face in &object.faces {
+                    let base_v = positions.len();
+                    let base_vt = texcoords.len();
+                    let transformed: Vec<Vec3> = face.positions.iter()
+                        .map(|&p| m.transform_point3(p))
+                        .collect();
+                    positions.extend_from_slice(&transformed);
+                    texcoords.extend_from_slice(&face.uvs);
+                    inst_refs.push((base_v, base_vt));
+                }
+                if !inst_refs.is_empty() {
+                    objects.push((inst.name.clone(), inst_refs));
+                }
+            }
         }
     }
 
@@ -592,119 +611,143 @@ pub fn export_glb(scene: &Scene, path: &Path) -> Result<(), String> {
     let mut json_nodes = Vec::new();
     let mut node_indices = Vec::new();
 
+    // Helper: emit one set of faces as a GLB mesh node
+    let emit_glb_object = |bin: &mut Vec<u8>,
+                                json_accessors: &mut Vec<String>,
+                                json_buffer_views: &mut Vec<String>,
+                                json_meshes: &mut Vec<String>,
+                                json_nodes: &mut Vec<String>,
+                                node_indices: &mut Vec<usize>,
+                                name: &str,
+                                faces: &[&Face]| {
+        if faces.is_empty() { return; }
+
+        let vertex_count = faces.len() * 4;
+        let index_count = faces.len() * 6;
+
+        let mut positions: Vec<f32> = Vec::with_capacity(vertex_count * 3);
+        let mut texcoords: Vec<f32> = Vec::with_capacity(vertex_count * 2);
+        let mut colors: Vec<f32> = Vec::with_capacity(vertex_count * 4);
+        let mut indices: Vec<u32> = Vec::with_capacity(index_count);
+
+        let mut min_pos = [f32::MAX; 3];
+        let mut max_pos = [f32::MIN; 3];
+
+        for face in faces {
+            let base = (positions.len() / 3) as u32;
+            for i in 0..4 {
+                let p = face.positions[i];
+                positions.extend_from_slice(&[p.x, p.y, p.z]);
+                min_pos[0] = min_pos[0].min(p.x);
+                min_pos[1] = min_pos[1].min(p.y);
+                min_pos[2] = min_pos[2].min(p.z);
+                max_pos[0] = max_pos[0].max(p.x);
+                max_pos[1] = max_pos[1].max(p.y);
+                max_pos[2] = max_pos[2].max(p.z);
+                texcoords.extend_from_slice(&[face.uvs[i].x, face.uvs[i].y]);
+                let c = face.colors[i];
+                colors.extend_from_slice(&[c.x, c.y, c.z, c.w]);
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+
+        let append = |bin: &mut Vec<u8>, data: &[u8]| -> (usize, usize) {
+            let offset = bin.len();
+            bin.extend_from_slice(data);
+            let len = data.len();
+            while !bin.len().is_multiple_of(4) { bin.push(0); }
+            (offset, len)
+        };
+
+        let (pos_off, pos_len) = append(bin, bytemuck::cast_slice::<f32, u8>(&positions));
+        let pos_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+            pos_off, pos_len
+        ));
+        let pos_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}}"#,
+            pos_bv, vertex_count,
+            min_pos[0], min_pos[1], min_pos[2],
+            max_pos[0], max_pos[1], max_pos[2],
+        ));
+
+        let (tc_off, tc_len) = append(bin, bytemuck::cast_slice::<f32, u8>(&texcoords));
+        let tc_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+            tc_off, tc_len
+        ));
+        let tc_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC2"}}"#,
+            tc_bv, vertex_count,
+        ));
+
+        let (col_off, col_len) = append(bin, bytemuck::cast_slice::<f32, u8>(&colors));
+        let col_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+            col_off, col_len
+        ));
+        let col_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC4"}}"#,
+            col_bv, vertex_count,
+        ));
+
+        let (idx_off, idx_len) = append(bin, bytemuck::cast_slice::<u32, u8>(&indices));
+        let idx_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34963}}"#,
+            idx_off, idx_len
+        ));
+        let idx_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
+            idx_bv, index_count,
+        ));
+
+        let mesh_idx = json_meshes.len();
+        let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+        json_meshes.push(format!(
+            r#"{{"name":"{}","primitives":[{{"attributes":{{"POSITION":{},"TEXCOORD_0":{},"COLOR_0":{}}},"indices":{},"mode":4}}]}}"#,
+            escaped_name, pos_acc, tc_acc, col_acc, idx_acc,
+        ));
+
+        let node_idx = json_nodes.len();
+        json_nodes.push(format!(
+            r#"{{"name":"{}","mesh":{}}}"#,
+            escaped_name, mesh_idx,
+        ));
+        node_indices.push(node_idx);
+    };
+
     for layer in &scene.layers {
         if !layer.visible { continue; }
         for object in &layer.objects {
+            // Source object
             let visible_faces: Vec<_> = object.faces.iter().filter(|f| !f.hidden).collect();
-            if visible_faces.is_empty() { continue; }
+            emit_glb_object(&mut bin, &mut json_accessors, &mut json_buffer_views,
+                &mut json_meshes, &mut json_nodes, &mut node_indices,
+                &object.name, &visible_faces);
 
-            let vertex_count = visible_faces.len() * 4;
-            let index_count = visible_faces.len() * 6;
-
-            let mut positions: Vec<f32> = Vec::with_capacity(vertex_count * 3);
-            let mut texcoords: Vec<f32> = Vec::with_capacity(vertex_count * 2);
-            let mut colors: Vec<f32> = Vec::with_capacity(vertex_count * 4);
-            let mut indices: Vec<u32> = Vec::with_capacity(index_count);
-
-            let mut min_pos = [f32::MAX; 3];
-            let mut max_pos = [f32::MIN; 3];
-
-            for face in &visible_faces {
-                let base = (positions.len() / 3) as u32;
-                for i in 0..4 {
-                    let p = face.positions[i];
-                    positions.extend_from_slice(&[p.x, p.y, p.z]);
-                    min_pos[0] = min_pos[0].min(p.x);
-                    min_pos[1] = min_pos[1].min(p.y);
-                    min_pos[2] = min_pos[2].min(p.z);
-                    max_pos[0] = max_pos[0].max(p.x);
-                    max_pos[1] = max_pos[1].max(p.y);
-                    max_pos[2] = max_pos[2].max(p.z);
-                    texcoords.extend_from_slice(&[face.uvs[i].x, face.uvs[i].y]);
-                    let c = face.colors[i];
-                    colors.extend_from_slice(&[c.x, c.y, c.z, c.w]);
-                }
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            // Flatten instances
+            for inst in &object.instances {
+                let m = inst.model_matrix();
+                let transformed: Vec<Face> = object.faces.iter().filter(|f| !f.hidden).map(|f| {
+                    let mut nf = f.clone();
+                    for p in &mut nf.positions {
+                        *p = m.transform_point3(*p);
+                    }
+                    nf
+                }).collect();
+                let refs: Vec<_> = transformed.iter().collect();
+                emit_glb_object(&mut bin, &mut json_accessors, &mut json_buffer_views,
+                    &mut json_meshes, &mut json_nodes, &mut node_indices,
+                    &inst.name, &refs);
             }
-
-            // Helper: append bytes to bin and return (offset, byte_length), aligned to 4
-            let mut append = |data: &[u8]| -> (usize, usize) {
-                let offset = bin.len();
-                bin.extend_from_slice(data);
-                let len = data.len();
-                while !bin.len().is_multiple_of(4) { bin.push(0); }
-                (offset, len)
-            };
-
-            // Position buffer view + accessor
-            let (pos_off, pos_len) = append(bytemuck::cast_slice::<f32, u8>(&positions));
-            let pos_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
-                pos_off, pos_len
-            ));
-            let pos_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}}"#,
-                pos_bv, vertex_count,
-                min_pos[0], min_pos[1], min_pos[2],
-                max_pos[0], max_pos[1], max_pos[2],
-            ));
-
-            // Texcoord buffer view + accessor
-            let (tc_off, tc_len) = append(bytemuck::cast_slice::<f32, u8>(&texcoords));
-            let tc_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
-                tc_off, tc_len
-            ));
-            let tc_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC2"}}"#,
-                tc_bv, vertex_count,
-            ));
-
-            // Color buffer view + accessor
-            let (col_off, col_len) = append(bytemuck::cast_slice::<f32, u8>(&colors));
-            let col_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
-                col_off, col_len
-            ));
-            let col_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC4"}}"#,
-                col_bv, vertex_count,
-            ));
-
-            // Index buffer view + accessor
-            let (idx_off, idx_len) = append(bytemuck::cast_slice::<u32, u8>(&indices));
-            let idx_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34963}}"#,
-                idx_off, idx_len
-            ));
-            let idx_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
-                idx_bv, index_count,
-            ));
-
-            // Mesh
-            let mesh_idx = json_meshes.len();
-            let escaped_name = object.name.replace('\\', "\\\\").replace('"', "\\\"");
-            json_meshes.push(format!(
-                r#"{{"name":"{}","primitives":[{{"attributes":{{"POSITION":{},"TEXCOORD_0":{},"COLOR_0":{}}},"indices":{},"mode":4}}]}}"#,
-                escaped_name, pos_acc, tc_acc, col_acc, idx_acc,
-            ));
-
-            // Node
-            let node_idx = json_nodes.len();
-            json_nodes.push(format!(
-                r#"{{"name":"{}","mesh":{}}}"#,
-                escaped_name, mesh_idx,
-            ));
-            node_indices.push(node_idx);
         }
     }
 
@@ -785,111 +828,141 @@ fn build_gltf_json_and_bin(scene: &Scene) -> Result<(String, Vec<u8>), String> {
     let mut json_nodes = Vec::new();
     let mut node_indices = Vec::new();
 
+    // Helper: emit one set of faces as a glTF mesh node
+    let emit_gltf_object = |bin: &mut Vec<u8>,
+                                 json_accessors: &mut Vec<String>,
+                                 json_buffer_views: &mut Vec<String>,
+                                 json_meshes: &mut Vec<String>,
+                                 json_nodes: &mut Vec<String>,
+                                 node_indices: &mut Vec<usize>,
+                                 name: &str,
+                                 faces: &[&Face]| {
+        if faces.is_empty() { return; }
+
+        let vertex_count = faces.len() * 4;
+        let index_count = faces.len() * 6;
+
+        let mut positions: Vec<f32> = Vec::with_capacity(vertex_count * 3);
+        let mut texcoords: Vec<f32> = Vec::with_capacity(vertex_count * 2);
+        let mut colors: Vec<f32> = Vec::with_capacity(vertex_count * 4);
+        let mut indices: Vec<u32> = Vec::with_capacity(index_count);
+        let mut min_pos = [f32::MAX; 3];
+        let mut max_pos = [f32::MIN; 3];
+
+        for face in faces {
+            let base = (positions.len() / 3) as u32;
+            for i in 0..4 {
+                let p = face.positions[i];
+                positions.extend_from_slice(&[p.x, p.y, p.z]);
+                min_pos[0] = min_pos[0].min(p.x);
+                min_pos[1] = min_pos[1].min(p.y);
+                min_pos[2] = min_pos[2].min(p.z);
+                max_pos[0] = max_pos[0].max(p.x);
+                max_pos[1] = max_pos[1].max(p.y);
+                max_pos[2] = max_pos[2].max(p.z);
+                texcoords.extend_from_slice(&[face.uvs[i].x, face.uvs[i].y]);
+                let c = face.colors[i];
+                colors.extend_from_slice(&[c.x, c.y, c.z, c.w]);
+            }
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+
+        let append = |bin: &mut Vec<u8>, data: &[u8]| -> (usize, usize) {
+            let offset = bin.len();
+            bin.extend_from_slice(data);
+            let len = data.len();
+            while !bin.len().is_multiple_of(4) { bin.push(0); }
+            (offset, len)
+        };
+
+        let (pos_off, pos_len) = append(bin, bytemuck::cast_slice::<f32, u8>(&positions));
+        let pos_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+            pos_off, pos_len
+        ));
+        let pos_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}}"#,
+            pos_bv, vertex_count,
+            min_pos[0], min_pos[1], min_pos[2],
+            max_pos[0], max_pos[1], max_pos[2],
+        ));
+
+        let (tc_off, tc_len) = append(bin, bytemuck::cast_slice::<f32, u8>(&texcoords));
+        let tc_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+            tc_off, tc_len
+        ));
+        let tc_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC2"}}"#,
+            tc_bv, vertex_count,
+        ));
+
+        let (col_off, col_len) = append(bin, bytemuck::cast_slice::<f32, u8>(&colors));
+        let col_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
+            col_off, col_len
+        ));
+        let col_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC4"}}"#,
+            col_bv, vertex_count,
+        ));
+
+        let (idx_off, idx_len) = append(bin, bytemuck::cast_slice::<u32, u8>(&indices));
+        let idx_bv = json_buffer_views.len();
+        json_buffer_views.push(format!(
+            r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34963}}"#,
+            idx_off, idx_len
+        ));
+        let idx_acc = json_accessors.len();
+        json_accessors.push(format!(
+            r#"{{"bufferView":{},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
+            idx_bv, index_count,
+        ));
+
+        let mesh_idx = json_meshes.len();
+        let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+        json_meshes.push(format!(
+            r#"{{"name":"{}","primitives":[{{"attributes":{{"POSITION":{},"TEXCOORD_0":{},"COLOR_0":{}}},"indices":{},"mode":4}}]}}"#,
+            escaped_name, pos_acc, tc_acc, col_acc, idx_acc,
+        ));
+
+        let node_idx = json_nodes.len();
+        json_nodes.push(format!(
+            r#"{{"name":"{}","mesh":{}}}"#,
+            escaped_name, mesh_idx,
+        ));
+        node_indices.push(node_idx);
+    };
+
     for layer in &scene.layers {
         if !layer.visible { continue; }
         for object in &layer.objects {
             let visible_faces: Vec<_> = object.faces.iter().filter(|f| !f.hidden).collect();
-            if visible_faces.is_empty() { continue; }
+            emit_gltf_object(&mut bin, &mut json_accessors, &mut json_buffer_views,
+                &mut json_meshes, &mut json_nodes, &mut node_indices,
+                &object.name, &visible_faces);
 
-            let vertex_count = visible_faces.len() * 4;
-            let index_count = visible_faces.len() * 6;
-
-            let mut positions: Vec<f32> = Vec::with_capacity(vertex_count * 3);
-            let mut texcoords: Vec<f32> = Vec::with_capacity(vertex_count * 2);
-            let mut colors: Vec<f32> = Vec::with_capacity(vertex_count * 4);
-            let mut indices: Vec<u32> = Vec::with_capacity(index_count);
-            let mut min_pos = [f32::MAX; 3];
-            let mut max_pos = [f32::MIN; 3];
-
-            for face in &visible_faces {
-                let base = (positions.len() / 3) as u32;
-                for i in 0..4 {
-                    let p = face.positions[i];
-                    positions.extend_from_slice(&[p.x, p.y, p.z]);
-                    min_pos[0] = min_pos[0].min(p.x);
-                    min_pos[1] = min_pos[1].min(p.y);
-                    min_pos[2] = min_pos[2].min(p.z);
-                    max_pos[0] = max_pos[0].max(p.x);
-                    max_pos[1] = max_pos[1].max(p.y);
-                    max_pos[2] = max_pos[2].max(p.z);
-                    texcoords.extend_from_slice(&[face.uvs[i].x, face.uvs[i].y]);
-                    let c = face.colors[i];
-                    colors.extend_from_slice(&[c.x, c.y, c.z, c.w]);
-                }
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            // Flatten instances
+            for inst in &object.instances {
+                let m = inst.model_matrix();
+                let transformed: Vec<Face> = object.faces.iter().filter(|f| !f.hidden).map(|f| {
+                    let mut nf = f.clone();
+                    for p in &mut nf.positions {
+                        *p = m.transform_point3(*p);
+                    }
+                    nf
+                }).collect();
+                let refs: Vec<_> = transformed.iter().collect();
+                emit_gltf_object(&mut bin, &mut json_accessors, &mut json_buffer_views,
+                    &mut json_meshes, &mut json_nodes, &mut node_indices,
+                    &inst.name, &refs);
             }
-
-            let mut append = |data: &[u8]| -> (usize, usize) {
-                let offset = bin.len();
-                bin.extend_from_slice(data);
-                let len = data.len();
-                while !bin.len().is_multiple_of(4) { bin.push(0); }
-                (offset, len)
-            };
-
-            let (pos_off, pos_len) = append(bytemuck::cast_slice::<f32, u8>(&positions));
-            let pos_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
-                pos_off, pos_len
-            ));
-            let pos_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}}"#,
-                pos_bv, vertex_count,
-                min_pos[0], min_pos[1], min_pos[2],
-                max_pos[0], max_pos[1], max_pos[2],
-            ));
-
-            let (tc_off, tc_len) = append(bytemuck::cast_slice::<f32, u8>(&texcoords));
-            let tc_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
-                tc_off, tc_len
-            ));
-            let tc_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC2"}}"#,
-                tc_bv, vertex_count,
-            ));
-
-            let (col_off, col_len) = append(bytemuck::cast_slice::<f32, u8>(&colors));
-            let col_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34962}}"#,
-                col_off, col_len
-            ));
-            let col_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5126,"count":{},"type":"VEC4"}}"#,
-                col_bv, vertex_count,
-            ));
-
-            let (idx_off, idx_len) = append(bytemuck::cast_slice::<u32, u8>(&indices));
-            let idx_bv = json_buffer_views.len();
-            json_buffer_views.push(format!(
-                r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":34963}}"#,
-                idx_off, idx_len
-            ));
-            let idx_acc = json_accessors.len();
-            json_accessors.push(format!(
-                r#"{{"bufferView":{},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
-                idx_bv, index_count,
-            ));
-
-            let mesh_idx = json_meshes.len();
-            let escaped_name = object.name.replace('\\', "\\\\").replace('"', "\\\"");
-            json_meshes.push(format!(
-                r#"{{"name":"{}","primitives":[{{"attributes":{{"POSITION":{},"TEXCOORD_0":{},"COLOR_0":{}}},"indices":{},"mode":4}}]}}"#,
-                escaped_name, pos_acc, tc_acc, col_acc, idx_acc,
-            ));
-
-            let node_idx = json_nodes.len();
-            json_nodes.push(format!(
-                r#"{{"name":"{}","mesh":{}}}"#,
-                escaped_name, mesh_idx,
-            ));
-            node_indices.push(node_idx);
         }
     }
 
@@ -926,72 +999,89 @@ pub fn export_dae(scene: &Scene, path: &Path) -> Result<(), String> {
     let mut geo_idx = 0;
     let mut geo_names: Vec<(String, String)> = Vec::new(); // (geo_id, name)
 
+    // Helper: emit a DAE geometry node from a set of face refs
+    let emit_dae_geo = |out: &mut String,
+                            geo_idx: &mut usize,
+                            geo_names: &mut Vec<(String, String)>,
+                            name: &str,
+                            faces: &[&Face]| {
+        if faces.is_empty() { return; }
+
+        let geo_id = format!("geometry{}", *geo_idx);
+        let safe_name = xml_escape(name);
+        geo_names.push((geo_id.clone(), safe_name.clone()));
+
+        writeln!(out, "    <geometry id=\"{geo_id}\" name=\"{safe_name}\">").unwrap();
+        writeln!(out, "      <mesh>").unwrap();
+
+        let vert_count = faces.len() * 4;
+        let pos_id = format!("{geo_id}-positions");
+        let pos_arr_id = format!("{geo_id}-positions-array");
+        write!(out, "        <source id=\"{pos_id}\"><float_array id=\"{pos_arr_id}\" count=\"{}\">", vert_count * 3).unwrap();
+        for face in faces {
+            for i in 0..4 {
+                let p = face.positions[i];
+                write!(out, "{} {} {} ", p.x, p.y, p.z).unwrap();
+            }
+        }
+        writeln!(out, "</float_array>").unwrap();
+        writeln!(out, "          <technique_common><accessor source=\"#{pos_arr_id}\" count=\"{vert_count}\" stride=\"3\">").unwrap();
+        writeln!(out, "            <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>").unwrap();
+        writeln!(out, "          </accessor></technique_common></source>").unwrap();
+
+        let map_id = format!("{geo_id}-map");
+        let map_arr_id = format!("{geo_id}-map-array");
+        write!(out, "        <source id=\"{map_id}\"><float_array id=\"{map_arr_id}\" count=\"{}\">", vert_count * 2).unwrap();
+        for face in faces {
+            for i in 0..4 {
+                write!(out, "{} {} ", face.uvs[i].x, face.uvs[i].y).unwrap();
+            }
+        }
+        writeln!(out, "</float_array>").unwrap();
+        writeln!(out, "          <technique_common><accessor source=\"#{map_arr_id}\" count=\"{vert_count}\" stride=\"2\">").unwrap();
+        writeln!(out, "            <param name=\"S\" type=\"float\"/><param name=\"T\" type=\"float\"/>").unwrap();
+        writeln!(out, "          </accessor></technique_common></source>").unwrap();
+
+        let vert_id = format!("{geo_id}-vertices");
+        writeln!(out, "        <vertices id=\"{vert_id}\"><input semantic=\"POSITION\" source=\"#{pos_id}\"/></vertices>").unwrap();
+
+        let tri_count = faces.len() * 2;
+        writeln!(out, "        <triangles count=\"{tri_count}\">").unwrap();
+        writeln!(out, "          <input semantic=\"VERTEX\" source=\"#{vert_id}\" offset=\"0\"/>").unwrap();
+        writeln!(out, "          <input semantic=\"TEXCOORD\" source=\"#{map_id}\" offset=\"1\" set=\"0\"/>").unwrap();
+        write!(out, "          <p>").unwrap();
+        for (fi, _face) in faces.iter().enumerate() {
+            let base = fi * 4;
+            write!(out, "{b} {b} {} {} {} {} ", base + 1, base + 1, base + 2, base + 2, b = base).unwrap();
+            write!(out, "{b} {b} {} {} {} {} ", base + 2, base + 2, base + 3, base + 3, b = base).unwrap();
+        }
+        writeln!(out, "</p>").unwrap();
+        writeln!(out, "        </triangles>").unwrap();
+
+        writeln!(out, "      </mesh>").unwrap();
+        writeln!(out, "    </geometry>").unwrap();
+        *geo_idx += 1;
+    };
+
     for layer in &scene.layers {
         if !layer.visible { continue; }
         for object in &layer.objects {
             let visible_faces: Vec<_> = object.faces.iter().filter(|f| !f.hidden).collect();
-            if visible_faces.is_empty() { continue; }
+            emit_dae_geo(&mut out, &mut geo_idx, &mut geo_names, &object.name, &visible_faces);
 
-            let geo_id = format!("geometry{geo_idx}");
-            let safe_name = xml_escape(&object.name);
-            geo_names.push((geo_id.clone(), safe_name.clone()));
-
-            writeln!(out, "    <geometry id=\"{geo_id}\" name=\"{safe_name}\">").unwrap();
-            writeln!(out, "      <mesh>").unwrap();
-
-            // Positions
-            let vert_count = visible_faces.len() * 4;
-            let pos_id = format!("{geo_id}-positions");
-            let pos_arr_id = format!("{geo_id}-positions-array");
-            write!(out, "        <source id=\"{pos_id}\"><float_array id=\"{pos_arr_id}\" count=\"{}\">", vert_count * 3).unwrap();
-            for face in &visible_faces {
-                for i in 0..4 {
-                    let p = face.positions[i];
-                    write!(out, "{} {} {} ", p.x, p.y, p.z).unwrap();
-                }
+            // Flatten instances
+            for inst in &object.instances {
+                let m = inst.model_matrix();
+                let transformed: Vec<Face> = object.faces.iter().filter(|f| !f.hidden).map(|f| {
+                    let mut nf = f.clone();
+                    for p in &mut nf.positions {
+                        *p = m.transform_point3(*p);
+                    }
+                    nf
+                }).collect();
+                let refs: Vec<_> = transformed.iter().collect();
+                emit_dae_geo(&mut out, &mut geo_idx, &mut geo_names, &inst.name, &refs);
             }
-            writeln!(out, "</float_array>").unwrap();
-            writeln!(out, "          <technique_common><accessor source=\"#{pos_arr_id}\" count=\"{vert_count}\" stride=\"3\">").unwrap();
-            writeln!(out, "            <param name=\"X\" type=\"float\"/><param name=\"Y\" type=\"float\"/><param name=\"Z\" type=\"float\"/>").unwrap();
-            writeln!(out, "          </accessor></technique_common></source>").unwrap();
-
-            // UVs
-            let map_id = format!("{geo_id}-map");
-            let map_arr_id = format!("{geo_id}-map-array");
-            write!(out, "        <source id=\"{map_id}\"><float_array id=\"{map_arr_id}\" count=\"{}\">", vert_count * 2).unwrap();
-            for face in &visible_faces {
-                for i in 0..4 {
-                    write!(out, "{} {} ", face.uvs[i].x, face.uvs[i].y).unwrap();
-                }
-            }
-            writeln!(out, "</float_array>").unwrap();
-            writeln!(out, "          <technique_common><accessor source=\"#{map_arr_id}\" count=\"{vert_count}\" stride=\"2\">").unwrap();
-            writeln!(out, "            <param name=\"S\" type=\"float\"/><param name=\"T\" type=\"float\"/>").unwrap();
-            writeln!(out, "          </accessor></technique_common></source>").unwrap();
-
-            // Vertices
-            let vert_id = format!("{geo_id}-vertices");
-            writeln!(out, "        <vertices id=\"{vert_id}\"><input semantic=\"POSITION\" source=\"#{pos_id}\"/></vertices>").unwrap();
-
-            // Triangles (quads → 2 triangles each)
-            let tri_count = visible_faces.len() * 2;
-            writeln!(out, "        <triangles count=\"{tri_count}\">").unwrap();
-            writeln!(out, "          <input semantic=\"VERTEX\" source=\"#{vert_id}\" offset=\"0\"/>").unwrap();
-            writeln!(out, "          <input semantic=\"TEXCOORD\" source=\"#{map_id}\" offset=\"1\" set=\"0\"/>").unwrap();
-            write!(out, "          <p>").unwrap();
-            for (fi, _face) in visible_faces.iter().enumerate() {
-                let base = fi * 4;
-                // Triangle 1: 0,1,2
-                write!(out, "{b} {b} {} {} {} {} ", base + 1, base + 1, base + 2, base + 2, b = base).unwrap();
-                // Triangle 2: 0,2,3
-                write!(out, "{b} {b} {} {} {} {} ", base + 2, base + 2, base + 3, base + 3, b = base).unwrap();
-            }
-            writeln!(out, "</p>").unwrap();
-            writeln!(out, "        </triangles>").unwrap();
-
-            writeln!(out, "      </mesh>").unwrap();
-            writeln!(out, "    </geometry>").unwrap();
-            geo_idx += 1;
         }
     }
 

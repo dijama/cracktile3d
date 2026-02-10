@@ -1,6 +1,34 @@
+use glam::{Mat4, Quat, Vec3};
 use serde::{Serialize, Deserialize};
 use wgpu::util::DeviceExt;
 use crate::scene::mesh::Face;
+
+/// A lightweight reference to a source object with an independent transform.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Instance {
+    pub name: String,
+    pub position: Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
+}
+
+impl Instance {
+    /// Compute the model (SRT) matrix for this instance.
+    pub fn model_matrix(&self) -> Mat4 {
+        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.position)
+    }
+}
+
+impl Default for Instance {
+    fn default() -> Self {
+        Self {
+            name: "Instance".to_string(),
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+        }
+    }
+}
 
 /// A collection of tile faces that share a single draw call.
 #[derive(Serialize, Deserialize)]
@@ -11,6 +39,9 @@ pub struct Object {
     pub gpu_mesh: Option<GpuMesh>,
     /// Index into Scene.tilesets for this object's texture. None = use placeholder.
     pub tileset_index: Option<usize>,
+    /// Lightweight instances that re-render this object's geometry with independent transforms.
+    #[serde(default)]
+    pub instances: Vec<Instance>,
 }
 
 pub struct GpuMesh {
@@ -26,6 +57,7 @@ impl Object {
             faces: Vec::new(),
             gpu_mesh: None,
             tileset_index: None,
+            instances: Vec::new(),
         }
     }
 

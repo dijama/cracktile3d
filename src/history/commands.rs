@@ -1,7 +1,7 @@
 use glam::{Quat, Vec2, Vec3, Vec4};
 use crate::history::Command;
 use crate::scene::mesh::Face;
-use crate::scene::{Object, Scene};
+use crate::scene::{Instance, Object, Scene};
 use crate::tools::draw::default_uvs;
 
 /// Hide selected faces (undoable).
@@ -1350,6 +1350,146 @@ impl Command for SubtractBlock {
 
     fn description(&self) -> &str {
         "Subtract Block"
+    }
+}
+
+/// Create a new instance for an object.
+pub struct CreateInstance {
+    pub layer: usize,
+    pub object: usize,
+    pub instance: Instance,
+}
+
+impl Command for CreateInstance {
+    fn apply(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        scene.layers[self.layer].objects[self.object].instances.push(self.instance.clone());
+    }
+
+    fn undo(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        scene.layers[self.layer].objects[self.object].instances.pop();
+    }
+
+    fn description(&self) -> &str {
+        "Create Instance"
+    }
+}
+
+/// Delete an instance from an object.
+pub struct DeleteInstance {
+    pub layer: usize,
+    pub object: usize,
+    pub instance_index: usize,
+    pub stored: Option<Instance>,
+}
+
+impl Command for DeleteInstance {
+    fn apply(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        let inst = scene.layers[self.layer].objects[self.object].instances.remove(self.instance_index);
+        self.stored = Some(inst);
+    }
+
+    fn undo(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        if let Some(inst) = self.stored.take() {
+            scene.layers[self.layer].objects[self.object].instances.insert(self.instance_index, inst);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Delete Instance"
+    }
+}
+
+/// Deconstruct an instance: remove it and create a new independent Object
+/// with face copies transformed by the instance matrix.
+pub struct DeconstructInstance {
+    pub layer: usize,
+    pub object: usize,
+    pub instance_index: usize,
+    stored_instance: Option<Instance>,
+    created_object_index: Option<usize>,
+}
+
+impl DeconstructInstance {
+    pub fn new(layer: usize, object: usize, instance_index: usize) -> Self {
+        Self { layer, object, instance_index, stored_instance: None, created_object_index: None }
+    }
+}
+
+impl Command for DeconstructInstance {
+    fn apply(&mut self, scene: &mut Scene, device: &wgpu::Device) {
+        let inst = scene.layers[self.layer].objects[self.object].instances.remove(self.instance_index);
+        let m = inst.model_matrix();
+
+        // Create transformed face copies
+        let faces: Vec<Face> = scene.layers[self.layer].objects[self.object].faces.iter().map(|f| {
+            let mut nf = f.clone();
+            for p in &mut nf.positions {
+                *p = m.transform_point3(*p);
+            }
+            nf
+        }).collect();
+
+        let mut new_obj = Object::new(format!("{} (deconstruct)", inst.name));
+        new_obj.faces = faces;
+        new_obj.tileset_index = scene.layers[self.layer].objects[self.object].tileset_index;
+        new_obj.rebuild_gpu_mesh(device);
+        scene.layers[self.layer].objects.push(new_obj);
+        self.created_object_index = Some(scene.layers[self.layer].objects.len() - 1);
+        self.stored_instance = Some(inst);
+    }
+
+    fn undo(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        if let Some(idx) = self.created_object_index.take() {
+            scene.layers[self.layer].objects.remove(idx);
+        }
+        if let Some(inst) = self.stored_instance.take() {
+            scene.layers[self.layer].objects[self.object].instances.insert(self.instance_index, inst);
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Deconstruct Instance"
+    }
+}
+
+/// Transform instances (translate/rotate/scale).
+pub struct TransformInstance {
+    pub targets: Vec<(usize, usize, usize)>, // (li, oi, instance_idx)
+    pub old_transforms: Vec<(Vec3, Quat, Vec3)>, // (position, rotation, scale)
+    pub new_transforms: Vec<(Vec3, Quat, Vec3)>,
+}
+
+impl Command for TransformInstance {
+    fn apply(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        for (i, &(li, oi, ii)) in self.targets.iter().enumerate() {
+            if let Some(inst) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.instances.get_mut(ii))
+            {
+                let (pos, rot, scl) = self.new_transforms[i];
+                inst.position = pos;
+                inst.rotation = rot;
+                inst.scale = scl;
+            }
+        }
+    }
+
+    fn undo(&mut self, scene: &mut Scene, _device: &wgpu::Device) {
+        for (i, &(li, oi, ii)) in self.targets.iter().enumerate() {
+            if let Some(inst) = scene.layers.get_mut(li)
+                .and_then(|l| l.objects.get_mut(oi))
+                .and_then(|o| o.instances.get_mut(ii))
+            {
+                let (pos, rot, scl) = self.old_transforms[i];
+                inst.position = pos;
+                inst.rotation = rot;
+                inst.scale = scl;
+            }
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Transform Instance"
     }
 }
 

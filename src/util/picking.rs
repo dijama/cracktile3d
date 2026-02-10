@@ -1,4 +1,4 @@
-use glam::{Mat4, Vec2, Vec3, Vec4Swizzles};
+use glam::{Mat3, Mat4, Vec2, Vec3, Vec4Swizzles};
 
 /// A ray in 3D space with origin and direction.
 #[derive(Debug, Clone, Copy)]
@@ -16,6 +16,8 @@ pub struct HitResult {
     pub layer_index: usize,
     pub object_index: usize,
     pub face_index: usize,
+    /// If the hit was on an instance, this is the instance index within the object.
+    pub instance_index: Option<usize>,
 }
 
 impl Ray {
@@ -151,10 +153,10 @@ fn pick_face_ex(
             continue;
         }
         for (oi, object) in layer.objects.iter().enumerate() {
+            // Test source object faces
             for (fi, face) in object.faces.iter().enumerate() {
                 if face.hidden { continue; }
                 let normal = face.normal();
-                // Skip back-facing faces (normal points away from camera)
                 if cull_backfaces && normal.dot(ray.direction) > 0.0 {
                     continue;
                 }
@@ -168,7 +170,47 @@ fn pick_face_ex(
                             layer_index: li,
                             object_index: oi,
                             face_index: fi,
+                            instance_index: None,
                         });
+                    }
+                }
+            }
+
+            // Test instance faces: transform ray into local space
+            for (ii, inst) in object.instances.iter().enumerate() {
+                let inv_model = inst.model_matrix().inverse();
+                let local_origin = inv_model.transform_point3(ray.origin);
+                let local_dir = inv_model.transform_vector3(ray.direction).normalize();
+                let local_ray = Ray { origin: local_origin, direction: local_dir };
+
+                let model = inst.model_matrix();
+                // Normal matrix: transpose of inverse of upper-left 3x3 (handles non-uniform scale)
+                let normal_matrix = Mat3::from_mat4(model.inverse().transpose());
+
+                for (fi, face) in object.faces.iter().enumerate() {
+                    if face.hidden { continue; }
+                    let local_normal = face.normal();
+                    if cull_backfaces && local_normal.dot(local_dir) > 0.0 {
+                        continue;
+                    }
+                    if let Some(t_local) = local_ray.intersect_quad(&face.positions) {
+                        // Convert hit back to world space for distance comparison
+                        let local_hit = local_ray.point_at(t_local);
+                        let world_hit = model.transform_point3(local_hit);
+                        let t_world = (world_hit - ray.origin).length();
+                        let world_normal = (normal_matrix * local_normal).normalize();
+                        let dominated = closest.as_ref().is_some_and(|c| c.distance <= t_world);
+                        if !dominated {
+                            closest = Some(HitResult {
+                                distance: t_world,
+                                position: world_hit,
+                                normal: world_normal,
+                                layer_index: li,
+                                object_index: oi,
+                                face_index: fi,
+                                instance_index: Some(ii),
+                            });
+                        }
                     }
                 }
             }

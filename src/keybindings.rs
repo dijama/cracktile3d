@@ -92,6 +92,7 @@ pub enum Action {
     TilebrushRotCCW,
     TilebrushFlipH,
     TilebrushFlipV,
+    CreateInstance,
 }
 
 /// All actions with their display names, for the editor UI.
@@ -132,6 +133,7 @@ pub const ALL_ACTIONS: &[(Action, &str)] = &[
     (Action::TilebrushRotCCW, "Tilebrush: Rotate CCW"),
     (Action::TilebrushFlipH, "Tilebrush: Flip H"),
     (Action::TilebrushFlipV, "Tilebrush: Flip V"),
+    (Action::CreateInstance, "Create Instance"),
 ];
 
 /// Keybinding configuration.
@@ -178,6 +180,7 @@ impl Keybindings {
         b.insert(Action::TilebrushRotCCW, KeyCombo { modifiers: Modifiers::SHIFT, key: KeyCode::KeyR });
         b.insert(Action::TilebrushFlipH, KeyCombo { modifiers: Modifiers::NONE, key: KeyCode::KeyF });
         b.insert(Action::TilebrushFlipV, KeyCombo { modifiers: Modifiers::NONE, key: KeyCode::KeyG });
+        b.insert(Action::CreateInstance, KeyCombo { modifiers: Modifiers::CTRL_SHIFT, key: KeyCode::KeyI });
         Self { bindings: b }
     }
 
